@@ -59,11 +59,12 @@ fmt.Println(api.Balance())
 
 ## All ids in v2 are strings
 
-v1 exposed numeric ids. In v2 almost every id is a **MongoDB ObjectId string** — `orderId`, `paymentId`, `countryId`, `periodId`, IP address ids, auth ids, `basket_id`, `order_id`. Never parse them into `int`/`int64`, never format them with `%d`, and do not assume they are sortable or sequential.
+v1 exposed numeric ids. In v2 almost every id is a **MongoDB ObjectId string** — `orderId`, `paymentId`, `countryId`, `periodId`, IP address ids, auth ids, `basket_id`, `order_id`. Never parse them into `int`/`int64`, never format them with `%d`, and do not assume they are sortable or sequential. On the request side the reference `*Id` fields also accept the stable code in place of the id (see [Current order API](#current-order-api)), which is one more reason to treat them as opaque strings.
 
 ```go
 made, err := client.MakeOrder(api.OrderRequest{
-    SectionCode: "ipv4", CountryCode: "USA", PeriodCode: "1m", Quantity: 1,
+    // *Id fields take an ObjectId or the stable code — both are opaque strings
+    SectionCode: "ipv4", CountryID: "USA", PeriodID: "1m", Quantity: 1,
     CustomTargetName: "seo",
 })
 // made["orderId"] == "68b1f0c4e13a4c0f1a2b3c4d" — a string, not 1000000
@@ -131,38 +132,71 @@ if limits, ok := api.AutoTopupLimitsFromError(err); ok {
 
 ## Current order API
 
-Use `OrderRequest` for stable codes and all current fields:
+Every `*Id` field of an order accepts **an ObjectId or the stable code**. If the value is not a known id and the paired `*Code` field is empty, the server resolves it as a code (`ClientApiService.normalizeOrderReferenceCodes`). The fallback covers `paymentId`, `countryId`, `periodId`, `operatorId`, `mixId` and `tarifId`, so a code-first order needs **no `*Code` field at all** — put the code straight into the id:
 
 ```go
 calc, err := client.CalculateOrder(api.OrderRequest{
     SectionCode: "mobile",
-    CountryCode: "USA",
-    PeriodCode: "1m",
+    CountryID: "USA",  // alpha3, uppercased by the server
+    PeriodID: "1m",    // period code, lowercased by the server
     Quantity: 1,
     MobileServiceType: "dedicated", // shared or dedicated; required for mobile
-    OperatorCode: "operator-code",
-    RotationCode: "5m",
+    OperatorID: "68b1f0c4e13a4c0f1a2b3c4d", // operator id, or its tag
+    RotationID: "5",   // MINUTES, "0" = By Link — not a code
 })
 
 mix, err := client.CalculateOrder(api.OrderRequest{
     SectionCode: "mix",
-    MixCode: "mix-code",
-    PeriodCode: "1m",
+    MixID: "68b1f0c4e13a4c0f1a2b3c9a", // mix package id, or its tag
+    PeriodID: "1m",
     Quantity: 10,
 })
 
 uptime, err := client.CalculateOrder(api.OrderRequest{
     SectionCode: "ipv4",
-    CountryCode: "USA",
-    PeriodCode: "1m",
+    CountryID: "USA",
+    PeriodID: "1m",
     Quantity: 1,
     Uptime: true,
+    CustomTargetName: "seo", // required for ipv4
 })
 ```
 
+The `*Code` fields (`CountryCode`, `PeriodCode`, `OperatorCode`, `MixCode`, `TarifCode`, `PaymentCode`) still work and are handy when you want to be explicit; `prepareOrder` clears the id of a pair when its code is set. Filling both is pointless.
+
+`RotationID` is the one field that is neither an id nor a code: it is the **rotation interval in minutes** as a numeric string — `"5"`, `"10"`, `"0"` for By Link. `RotationCode` is redundant, because the server only checks `isInteger()` and copies the value into `rotationId` without any reference lookup — a non-numeric value is answered with `"Set existed [rotationCode] from reference"`, and a non-numeric `rotationId` (`"5m"`) dies in `requestDto.rotationId as int` and comes back as `"Unknown error"`, code 35.
+
+### What you can pass, and where to get it
+
+`reference/list` publishes far fewer codes than the request accepts. What is really in the response (`ClientApiService.buildLegacyReferenceItem`):
+
+| Request field | Accepts | In `reference/list`? | Where it comes from |
+|---|---|---|---|
+| `countryId` | ObjectId or alpha3 code | yes | `country[].id`, code = `country[].alpha3`; uppercased by the server |
+| `countryCode` | alpha3 code | yes | `country[].alpha3` |
+| `periodId` | ObjectId or period code | id only | `period[].id`; `period[]` has just `id` and `name` |
+| `periodCode` | period code (`"1m"`) | **no** | not in the reference — hardcode it or send `periodId` |
+| `operatorId` | ObjectId or operator tag | id only | `country[].operators.dedicated[].id` / `.shared[].id` |
+| `operatorCode` | operator tag | **no** | tag is not in the reference — send `operatorId` |
+| `rotationId` | **minutes**, `0` = By Link | yes (as the value) | `country[].operators.*[].rotations[].id` is the minute count |
+| `rotationCode` | must be an integer; copied verbatim | n/a | no codes exist; use `rotationId` |
+| `mixId` | ObjectId or mix tag | yes | `quantities[].id`; tag = `country[].tag` under `mix` / `mix_isp` |
+| `mixCode` | mix tag | yes (mix only) | `country[].tag` of `reference/list/mix` |
+| `tarifId` | ObjectId or tariff code | id only | `tarifs[].id`; `tarifs[]` has `id`, `name`, `personal` |
+| `tarifCode` | `ResidentTariffPlan.code` | **no** | not in the reference — send `tarifId` |
+| `paymentId` | ObjectId or payment code | not in this reference | `balance/payments/list` → `id` (that list returns `id` and `name` only) |
+| `paymentCode` | `PaymentSystem.code` or a type name (`"balance"`) | **no** | not published by `balance/payments/list` (`BalancePaymentItemClientDto` = `id` + `name`); and `balance/add` resolves neither field — it needs a real `paymentId` |
+
 `customTargetName` is required for `ipv4`, `ipv6`, `isp` and for `mix`/`mix_isp` that the server cannot resolve to a MIX package (otherwise it falls back to ipv4 and answers `"Incorrect goal"`, code 14). The SDK checks this locally and mirrors `ClientApiService.parseMixSelection`: a MIX is considered resolved by `mixId`/`mixCode`, by `countryId` in `"packageId:quantity"` form, or by `countryId` together with `quantity > 0`.
 
-The legacy `OrderCalcMobile`/`OrderMakeMobile` helpers send `mobileServiceType=dedicated`; `OrderCalcMobile` no longer builds an IPv6 request. For code-first, MIX, uptime, scraper/shared, or other new combinations, use `OrderRequest`.
+The legacy positional helpers take the same values, so codes go in without any placeholder chain — only `authorization` and `coupon` are genuinely optional:
+
+```go
+calc, err := client.OrderCalcMobile("USA", "1m", 1, "", "", "68b1f0c4e13a4c0f1a2b3c4d", "5")
+ipv4, err := client.OrderCalcIpv4("USA", "1m", 1, "", "", "seo")
+```
+
+`OrderCalcMobile`/`OrderMakeMobile` always send `mobileServiceType=dedicated`, and `OrderCalcMobile` no longer builds an IPv6 request. For shared mobile, MIX, uptime, scraper or other new combinations, use `OrderRequest`.
 
 ## proxy/replace takes a reason, not a proxy type
 
@@ -198,7 +232,7 @@ The legacy download helpers return a bare `string`/`[]byte` and swallow errors. 
 
 ## Prolong, proxy and resident options
 
-- `CalculateProlong` / `MakeProlong` accept `ProlongRequest` with proxy IDs, MIX separator IDs, `periodCode`, and `paymentCode`.
+- `CalculateProlong` / `MakeProlong` accept `ProlongRequest` with proxy IDs, MIX separator IDs, `periodId`/`periodCode` and `paymentId`/`paymentCode`. `normalizeProlongReferenceCodes` has the same id-or-code fallback as orders for those two fields, so `PeriodID: "1m"` is enough.
 - `ListProxies` accepts all current filters through `ProxyListOptions`.
 - `CreateResidentList` and `CreateResidentSubuserList` accept geo, export and rotation options.
 - `CreateResidentSubuser` / `UpdateResidentSubuser` include string traffic limits, expiration, rotation, active and link-date fields.
