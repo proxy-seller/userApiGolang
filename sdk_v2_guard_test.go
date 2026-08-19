@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -566,5 +567,62 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 	client4, _ := newTestClient(t, envelopeHandler(t, insufficient, nil))
 	if _, err = client4.CalculateProlong("ipv4", ProlongRequest{IDs: []string{"x"}, PeriodID: "1m"}); err != nil {
 		t.Fatalf("prolong/calc warning не должен становиться ошибкой: %v", err)
+	}
+}
+
+// TestSplitProlongTargets — клиент продлевает по адресам, которые видит в proxy/list, а не по
+// ObjectId. Каждое значение маршрутизируется по форме, так что смешанный список тоже работает.
+func TestSplitProlongTargets(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   interface{}
+		wantIPs []string
+		wantIDs []string
+	}{
+		{"ipv4", []string{"1.2.3.4", "5.6.7.8"}, []string{"1.2.3.4", "5.6.7.8"}, nil},
+		{"ipv6 host:port", []string{"2001:db8::1:8080"}, []string{"2001:db8::1:8080"}, nil},
+		{"mobile triple", []string{"10.0.0.1:8000:9000"}, []string{"10.0.0.1:8000:9000"}, nil},
+		{"objectids", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, nil, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
+		{"mixed", []string{"1.2.3.4", "68b1f0c4e13a4c0f1a2b3c4d"}, []string{"1.2.3.4"}, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
+		{"comma string", "1.2.3.4, 5.6.7.8", []string{"1.2.3.4", "5.6.7.8"}, nil},
+		{"blanks dropped", []string{"1.2.3.4", "   ", ""}, []string{"1.2.3.4"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ips, ids := splitProlongTargets(tc.input)
+			if !reflect.DeepEqual(ips, tc.wantIPs) {
+				t.Fatalf("ips = %#v, want %#v", ips, tc.wantIPs)
+			}
+			if !reflect.DeepEqual(ids, tc.wantIDs) {
+				t.Fatalf("ids = %#v, want %#v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+// TestPrepareLegacyProlongSendsIPs — адреса уезжают в ips, а поле ids при этом не появляется
+// пустым: сервер отдаёт приоритет ids, и пустой список молча отменил бы продление по адресам.
+func TestPrepareLegacyProlongSendsIPs(t *testing.T) {
+	c := NewClient("test-key")
+	data := c.prepareLegacyProlong([]string{"1.2.3.4"}, "1m", "")
+	if _, present := data["ids"]; present {
+		t.Fatalf("ids must be absent when prolonging by address, got %#v", data)
+	}
+	ips, ok := data["ips"].([]string)
+	if !ok || len(ips) != 1 || ips[0] != "1.2.3.4" {
+		t.Fatalf("ips = %#v, want [1.2.3.4]", data["ips"])
+	}
+}
+
+// TestOrderMixSendsMixId — идентификатор MIX-пакета должен уходить в mixId: parseMixSelection
+// ищет пакет через findById(mixId), а countryId для него — не то поле.
+func TestOrderMixSendsMixId(t *testing.T) {
+	c := NewClient("test-key")
+	data := c.prepareMix("mix", "europe-2-mix_IPv4", "1m", 10, "", "", "")
+	if got := data["mixId"]; got != "europe-2-mix_IPv4" {
+		t.Fatalf("mixId = %#v, want the package code", got)
+	}
+	if got, present := data["countryId"]; present {
+		t.Fatalf("countryId must not be sent for a mix order, got %#v", got)
 	}
 }

@@ -28,10 +28,8 @@ import (
 func main() {
     client := api.NewClient(
         "YOUR_API_KEY",
-        api.WithBaseURL("http://127.0.0.1:7995/personal/api/v2/"),
         api.WithTimeout(15*time.Second),
     )
-    client.SetPaymentCode("balance") // stable across prod/dev
 
     balance, err := client.Balance()
     if err != nil {
@@ -45,7 +43,29 @@ func main() {
 }
 ```
 
-`WithHTTPClient` accepts an injected `*http.Client` (custom transport, TLS, tracing, local stubs). `WithTimeout` defaults to 30 seconds. `baseURL` must include `/personal/api/v2/`.
+Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by default. `WithTimeout` defaults to 30 seconds.
+
+### Paying for orders
+
+Every order and renewal needs a payment system. Take one from `BalancePaymentsList` and set it once:
+
+```go
+payments, _ := client.BalancePaymentsList()   // [{id: "69e7…", name: "PayPal"}, …]
+client.SetPaymentId(payments[0]["id"].(string))
+```
+
+This is the one place where an id is unavoidable: several payment systems share the same internal code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code cannot tell them apart. Everywhere else you use human-readable codes.
+
+<details>
+<summary>Pointing the client at another host (local testing)</summary>
+
+```go
+client := api.NewClient("YOUR_API_KEY", api.WithBaseURL("http://localhost:7995/personal/api/v2/"))
+```
+
+`WithHTTPClient` accepts an injected `*http.Client` (custom transport, TLS, tracing, local stubs). The base URL must include `/personal/api/v2/`.
+
+</details>
 
 Every endpoint is available as a method on `*Client`. The old package-level API remains available and delegates to `DefaultClient`:
 
@@ -132,7 +152,7 @@ if limits, ok := api.AutoTopupLimitsFromError(err); ok {
 
 ## Current order API
 
-Every `*Id` field of an order accepts **an ObjectId or the stable code**. If the value is not a known id and the paired `*Code` field is empty, the server resolves it as a code (`ClientApiService.normalizeOrderReferenceCodes`). The fallback covers `paymentId`, `countryId`, `periodId`, `operatorId`, `mixId` and `tarifId`, so a code-first order needs **no `*Code` field at all** — put the code straight into the id:
+Every `*Id` field of an order takes **the readable code** — `USA`, `1m`, `europe-2-mix_IPv4`. If the value is not a known ObjectId and the paired `*Code` field is empty, the server resolves it as a code (`ClientApiService.normalizeOrderReferenceCodes`). This covers `countryId`, `periodId`, `operatorId`, `mixId`, `tarifId` and `paymentId`, so an order needs **no `*Code` field at all** — put the code straight into the id:
 
 ```go
 calc, err := client.CalculateOrder(api.OrderRequest{
@@ -168,26 +188,23 @@ The `*Code` fields (`CountryCode`, `PeriodCode`, `OperatorCode`, `MixCode`, `Tar
 
 ### What you can pass, and where to get it
 
-`reference/list` publishes far fewer codes than the request accepts. What is really in the response (`ClientApiService.buildLegacyReferenceItem`):
+`reference/list` gives you a readable code for every field. Read it, pass the code straight into the request field — there is no id to look up:
 
-| Request field | Accepts | In `reference/list`? | Where it comes from |
-|---|---|---|---|
-| `countryId` | ObjectId or alpha3 code | yes | `country[].id`, code = `country[].alpha3`; uppercased by the server |
-| `countryCode` | alpha3 code | yes | `country[].alpha3` |
-| `periodId` | ObjectId or period code | id only | `period[].id`; `period[]` has just `id` and `name` |
-| `periodCode` | period code (`"1m"`) | **no** | not in the reference — hardcode it or send `periodId` |
-| `operatorId` | ObjectId or operator tag | id only | `country[].operators.dedicated[].id` / `.shared[].id` |
-| `operatorCode` | operator tag | **no** | tag is not in the reference — send `operatorId` |
-| `rotationId` | **minutes**, `0` = By Link | yes (as the value) | `country[].operators.*[].rotations[].id` is the minute count |
-| `rotationCode` | must be an integer; copied verbatim | n/a | no codes exist; use `rotationId` |
-| `mixId` | ObjectId or mix tag | yes | `quantities[].id`; tag = `country[].tag` under `mix` / `mix_isp` |
-| `mixCode` | mix tag | yes (mix only) | `country[].tag` of `reference/list/mix` |
-| `tarifId` | ObjectId or tariff code | id only | `tarifs[].id`; `tarifs[]` has `id`, `name`, `personal` |
-| `tarifCode` | `ResidentTariffPlan.code` | **no** | not in the reference — send `tarifId` |
-| `paymentId` | ObjectId or payment code | not in this reference | `balance/payments/list` → `id` (that list returns `id` and `name` only) |
-| `paymentCode` | `PaymentSystem.code` or a type name (`"balance"`) | **no** | not published by `balance/payments/list` (`BalancePaymentItemClientDto` = `id` + `name`); and `balance/add` resolves neither field — it needs a real `paymentId` |
+| Request field | Pass this | Read it from |
+|---|---|---|
+| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `reference/list` → `country[].alpha3` |
+| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `reference/list` → `period[].code` |
+| `operatorId` | mobile operator tag — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `tag` |
+| `rotationId` | **minutes as an integer**, `0` = By Link. The one field with no code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
+| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].tag`, e.g. `europe-2-mix_IPv4`. `OrderCalcMix`/`OrderMakeMix` take it as the first argument |
+| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].code` |
+| `paymentId` | payment-system ObjectId — the one unavoidable id | `balance/payments/list` → `id` (see [Paying for orders](#paying-for-orders)) |
 
-`customTargetName` is required for `ipv4`, `ipv6`, `isp` and for `mix`/`mix_isp` that the server cannot resolve to a MIX package (otherwise it falls back to ipv4 and answers `"Incorrect goal"`, code 14). The SDK checks this locally and mirrors `ClientApiService.parseMixSelection`: a MIX is considered resolved by `mixId`/`mixCode`, by `countryId` in `"packageId:quantity"` form, or by `countryId` together with `quantity > 0`.
+ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer publishes them. Code resolution happens in `order/calc`, `order/make`, `prolong/calc` and `prolong/make`.
+
+The paired `*Code` fields (`CountryCode`, `PeriodCode`, `OperatorCode`, `MixCode`, `TarifCode`, `PaymentCode`) are still accepted and do the same job explicitly. You do not need them: a code in the `*Id` field resolves the same way. `RotationCode` is the exception — the server only copies it into `rotationId` and rejects a non-integer, so set `RotationID` and ignore it.
+
+`customTargetName` — what you use the proxies for. Required for `ipv4`, `ipv6` and `isp`. For `mix`/`mix_isp` it is only needed when the server cannot tell which MIX package you mean; naming the package (`MixID`, or the first argument of `OrderCalcMix`) removes the need for it. Order a mix without either and the server answers `"Incorrect goal"`, code 14.
 
 The legacy positional helpers take the same values, so codes go in without any placeholder chain — only `authorization` and `coupon` are genuinely optional:
 
@@ -230,9 +247,38 @@ file, err := client.DownloadProxies("subresident", api.ProxyDownloadOptions{
 
 The legacy download helpers return a bare `string`/`[]byte` and swallow errors. Use the `*E` variants when you need the reason: `ProxyDownloadE`, `ProxyDownloadResidentE`, `ResidentGeoE`, `ResidentGeoIspE` (or the `*Client` methods, which all return an error).
 
+## Renewing proxies
+
+Renew by the addresses themselves — the same strings `ListProxies` gives you. No ids to look up:
+
+```go
+list, _ := client.ListProxies("ipv4")
+items := list["items"].([]interface{})
+
+ips := make([]string, 0, len(items))
+for _, item := range items {
+    ips = append(ips, item.(map[string]interface{})["ip"].(string))
+}
+
+quote, _ := client.ProlongCalc("ipv4", ips, "1m", "")   // price first
+order, err := client.ProlongMake("ipv4", ips, "1m", "") // deducts money
+```
+
+`ProlongCalc` shows the price; `ProlongMake` charges the balance. If the balance is short, `ProlongMake` returns an `*APIError` with the server's warning — it never reports a renewal that did not happen.
+
+The address format follows the proxy type, exactly as it comes back from `ListProxies`:
+
+| type | address |
+|---|---|
+| `ipv4`, `isp`, `mix` | `1.2.3.4` |
+| `ipv6` | `host:port` |
+| `mobile` | `ip:portHttp:portSocks` |
+
+ObjectId strings still work, and a mixed slice works too — each value is routed by its shape.
+
 ## Prolong, proxy and resident options
 
-- `CalculateProlong` / `MakeProlong` accept `ProlongRequest` with proxy IDs, MIX separator IDs, `periodId`/`periodCode` and `paymentId`/`paymentCode`. `normalizeProlongReferenceCodes` has the same id-or-code fallback as orders for those two fields, so `PeriodID: "1m"` is enough.
+- `CalculateProlong` / `MakeProlong` are the struct-based form of the same two calls: `ProlongRequest` carries `IPs` or `IDs`, `PeriodID`/`PeriodCode` and `PaymentID`/`PaymentCode`. `normalizeProlongReferenceCodes` has the same id-or-code fallback as orders, so `PeriodID: "1m"` is enough.
 - `ListProxies` accepts all current filters through `ProxyListOptions`.
 - `CreateResidentList` and `CreateResidentSubuserList` accept geo, export and rotation options.
 - `CreateResidentSubuser` / `UpdateResidentSubuser` include string traffic limits, expiration, rotation, active and link-date fields.
@@ -254,6 +300,7 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 | `type` of `proxy/replace` looked like a proxy type | it is the replacement reason enum |
 | `package_key` on `proxy/download/resident` | only on `proxy/download/subresident` |
 | numeric `paymentId` | ObjectId string from `balance/payments/list`; `paymentCode` works for orders and prolong but **not** for `balance/add` |
+| numeric proxy ids for renewal | pass the addresses instead — `ProlongCalc`/`ProlongMake` accept what `ListProxies` returns |
 | `errors[].code` read as a number from an `interface{}` field | typed `APIErrorCode`, use `CodeInt()` |
 
 ## Changelog
@@ -281,4 +328,4 @@ go vet ./...
 go test ./...
 ```
 
-To exercise a local `client-api-service`, run it on port 7995 and construct the client with `WithBaseURL("http://127.0.0.1:7995/personal/api/v2/")`. Use a development API key and call read-only endpoints first (`Balance`, `AuthList`, `ResidentLists`).
+To exercise a `client-api-service` you run yourself, point the client at it with `WithBaseURL` and call read-only endpoints first (`Balance`, `AuthList`, `ResidentLists`).

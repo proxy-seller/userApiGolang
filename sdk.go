@@ -969,12 +969,12 @@ func (c *Client) OrderCalcIsp(countryId string, periodId string, quantity int, a
 //	'price' => 7.02
 //
 // ]
-func OrderCalcMix(countryId string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
-	return legacyClient().OrderCalcMix(countryId, periodId, quantity, authorization, coupon, customTargetName)
+func OrderCalcMix(mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
+	return legacyClient().OrderCalcMix(mix, periodId, quantity, authorization, coupon, customTargetName)
 }
 
-func (c *Client) OrderCalcMix(countryId string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
-	return c.orderCalc(c.prepareRegular("mix", countryId, periodId, quantity, authorization, coupon, customTargetName))
+func (c *Client) OrderCalcMix(mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
+	return c.orderCalc(c.prepareMix("mix", mix, periodId, quantity, authorization, coupon, customTargetName))
 }
 
 // OrderCalcIpv6 Calculate the order IPv6
@@ -1162,12 +1162,12 @@ func (c *Client) OrderMakeIsp(countryId string, periodId string, quantity int, a
 //	'balance' => 10.19
 //
 // ]
-func OrderMakeMix(countryId string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
-	return legacyClient().OrderMakeMix(countryId, periodId, quantity, authorization, coupon, customTargetName)
+func OrderMakeMix(mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
+	return legacyClient().OrderMakeMix(mix, periodId, quantity, authorization, coupon, customTargetName)
 }
 
-func (c *Client) OrderMakeMix(countryId string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
-	return c.orderMake(c.prepareRegular("mix", countryId, periodId, quantity, authorization, coupon, customTargetName))
+func (c *Client) OrderMakeMix(mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) (map[string]interface{}, error) {
+	return c.orderMake(c.prepareMix("mix", mix, periodId, quantity, authorization, coupon, customTargetName))
 }
 
 // OrderMakeIpv6 Create an order IPv6
@@ -1255,6 +1255,22 @@ func (c *Client) prepareRegular(sectionCode string, countryId string, periodId s
 	data := map[string]interface{}{
 		"sectionCode":      sectionCode,
 		"countryId":        countryId,
+		"periodId":         periodId,
+		"quantity":         quantity,
+		"authorization":    authorization,
+		"coupon":           coupon,
+		"customTargetName": customTargetName,
+	}
+	return c.withPayment(data)
+}
+
+// prepareMix — заказ MIX-пакета. Идентификатор пакета идёт в mixId, а не в countryId:
+// parseMixSelection ищет пакет через findById(mixId), а тег в ObjectId переводит
+// normalizeOrderReferenceCodes — тоже только для mixId.
+func (c *Client) prepareMix(sectionCode string, mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) map[string]interface{} {
+	data := map[string]interface{}{
+		"sectionCode":      sectionCode,
+		"mixId":            mix,
 		"periodId":         periodId,
 		"quantity":         quantity,
 		"authorization":    authorization,
@@ -2111,11 +2127,61 @@ func (c *Client) ResidentsubuserListTools(package_key string) (map[string]interf
 
 /////////////////////////////// Prolong ///////////////////////////////
 
-func (c *Client) prepareLegacyProlong(ids interface{}, periodId string, coupon string) map[string]interface{} {
+// splitProlongTargets разводит то, что пришло от вызывающего, на адреса и ObjectId.
+//
+// Клиенту удобнее всего продлевать по самим адресам — именно их он видит
+// в proxy/list и в выгрузке. Сервер принимает их в поле ips и сам переводит в ids
+// (ClientApiService.resolveProlongIpsToIds — вызывается безусловно и для calc, и для make).
+// Формат адреса зависит от типа: ipv4/isp/mix — "ip", ipv6 — "host:port",
+// mobile — "ip:portHttp:portSocks". ObjectId — 24 hex-символа без точек и двоеточий,
+// поэтому одно от другого отличается надёжно и смешанный список тоже работает.
+func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
+	var items []string
+	switch value := ipsOrIds.(type) {
+	case string:
+		items = splitIDs(value)
+	case []string:
+		items = value
+	case nil:
+		return nil, nil
+	default:
+		if list, ok := ipsOrIds.([]interface{}); ok {
+			for _, item := range list {
+				if text, ok := item.(string); ok {
+					items = append(items, text)
+				}
+			}
+		}
+	}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if strings.ContainsAny(item, ".:") {
+			ips = append(ips, item)
+		} else {
+			ids = append(ids, item)
+		}
+	}
+	return ips, ids
+}
+
+func (c *Client) prepareLegacyProlong(ipsOrIds interface{}, periodId string, coupon string) map[string]interface{} {
 	data := map[string]interface{}{
-		"ids":      normalizeIDs(ids),
 		"periodId": periodId,
 		"coupon":   coupon,
+	}
+	if ips, ids := splitProlongTargets(ipsOrIds); len(ips) > 0 || len(ids) > 0 {
+		if len(ips) > 0 {
+			data["ips"] = ips
+		}
+		if len(ids) > 0 {
+			data["ids"] = ids
+		}
+	} else {
+		// Тип, который не разобрали, уходит как был — пусть ошибку назовёт сервер.
+		data["ids"] = normalizeIDs(ipsOrIds)
 	}
 	// Здесь paymentCode резолвится сервером (normalizeProlongReferenceCodes), в отличие
 	// от balance/add.
@@ -2143,28 +2209,32 @@ func normalizeIDs(ids interface{}) interface{} {
 
 // ProlongCalc Calculate the renewal
 // @param proxyType - ipv4 | ipv6 | mobile | isp | mix
-// @param ids - ObjectId strings of IP addresses
+// @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
+// for ipv4/isp/mix, "host:port" for ipv6, "ip:portHttp:portSocks" for mobile. ObjectId strings
+// are accepted too, and a mixed slice works — each value is routed by shape (splitProlongTargets).
 // @param periodId - ObjectId string OR the period code ("1m"): prolong resolves a non-id value as a
 // code exactly like order/* (ClientApiService.normalizeProlongReferenceCodes)
-func ProlongCalc(proxyType string, ids interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	return legacyClient().ProlongCalc(proxyType, ids, periodId, coupon)
+func ProlongCalc(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
+	return legacyClient().ProlongCalc(proxyType, ipsOrIds, periodId, coupon)
 }
 
-func (c *Client) ProlongCalc(proxyType string, ids interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	result, err := c.Request(http.MethodPost, "prolong/calc/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ids, periodId, coupon))
+func (c *Client) ProlongCalc(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
+	result, err := c.Request(http.MethodPost, "prolong/calc/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ipsOrIds, periodId, coupon))
 	return result.Map, err
 }
 
 // ProlongMake Create a renewal order. Attention! Deducts money from the balance.
 // @param proxyType - ipv4 | ipv6 | mobile | isp | mix
-// @param ids - ObjectId strings of IP addresses
+// @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
+// for ipv4/isp/mix, "host:port" for ipv6, "ip:portHttp:portSocks" for mobile. ObjectId strings
+// are accepted too, and a mixed slice works — each value is routed by shape (splitProlongTargets).
 // @param periodId - ObjectId string OR the period code ("1m")
-func ProlongMake(proxyType string, ids interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	return legacyClient().ProlongMake(proxyType, ids, periodId, coupon)
+func ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
+	return legacyClient().ProlongMake(proxyType, ipsOrIds, periodId, coupon)
 }
 
-func (c *Client) ProlongMake(proxyType string, ids interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ids, periodId, coupon))
+func (c *Client) ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
+	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ipsOrIds, periodId, coupon))
 	if err != nil {
 		return result.Map, err
 	}
@@ -2445,7 +2515,11 @@ func (c *Client) SetProxyComment(ids []string, comment string) (map[string]inter
 // *Id-or-code fallback as orders, but only for PeriodID and PaymentID — the two reference fields
 // prolong accepts.
 type ProlongRequest struct {
-	IDs               []string `json:"ids,omitempty"`
+	IDs []string `json:"ids,omitempty"`
+	// IPs — сами адреса вместо ObjectId: ipv4/isp/mix — "ip", ipv6 — "host:port",
+	// mobile — "ip:portHttp:portSocks". Сервер сам резолвит их в IDs. Если заполнены оба
+	// поля, сервер берёт IDs.
+	IPs               []string `json:"ips,omitempty"`
 	OrderSeparatorIDs []string `json:"orderSeparatorIds,omitempty"`
 	OrderSeparatorID  string   `json:"orderSeparatorId,omitempty"`
 	Coupon            string   `json:"coupon,omitempty"`
