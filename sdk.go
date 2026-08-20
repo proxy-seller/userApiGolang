@@ -850,7 +850,7 @@ func String(value string) *string    { return &value }
 // What the reference really carries, field by field (ClientApiService.buildLegacyReferenceItem):
 //
 //	country[]                  id, name, alpha3         → alpha3 IS the country code
-//	period[]                   id, name                 → no period code in the reference
+//	period[]                   id, name                 → id is the period code ("1m")
 //	country[].operators.*[]    id, name, rotations[]    → no operator code (tag) in the reference
 //	   .rotations[]            id, name                 → id is the interval in MINUTES, 0 = By Link
 //	quantities[]               id, name, quantities[]   → mix package id + allowed quantities
@@ -879,10 +879,9 @@ func (c *Client) ReferenceList(proxyType string) (map[string]interface{}, error)
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -913,10 +912,9 @@ func (c *Client) OrderCalcIpv4(countryId string, periodId string, quantity int, 
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -949,10 +947,9 @@ func (c *Client) OrderCalcIsp(countryId string, periodId string, quantity int, a
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -983,10 +980,9 @@ func (c *Client) OrderCalcMix(mix string, periodId string, quantity int, authori
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -1085,10 +1081,9 @@ func (c *Client) OrderCalcResident(tarifId string, coupon string) (map[string]in
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -1115,10 +1110,9 @@ func (c *Client) OrderMakeIpv4(countryId string, periodId string, quantity int, 
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -1146,10 +1140,9 @@ func (c *Client) OrderMakeIsp(countryId string, periodId string, quantity int, a
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -1176,10 +1169,9 @@ func (c *Client) OrderMakeMix(mix string, periodId string, quantity int, authori
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
 // country code: a *Id value that is not an ObjectId is resolved as a code
 // (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].alpha3, uppercased by the server ("USA").
+// reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
-// the server ("1m", "3m"). reference/list publishes only period[].id and period[].name — the code
-// itself is not part of the reference, so hardcode it or use periodId.
+// the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
@@ -2290,7 +2282,7 @@ func assertProlongMade(data map[string]interface{}) (map[string]interface{}, err
 type OrderRequest struct {
 	// CountryID — ObjectId OR country code (alpha3, uppercased by the server: "USA").
 	CountryID string `json:"countryId,omitempty"`
-	// CountryCode — alpha3, available from reference/list → country[].alpha3.
+	// CountryCode — alpha3, available from reference/list → country[].id.
 	CountryCode string `json:"countryCode,omitempty"`
 	// SectionCode — ipv4 | ipv6 | isp | mobile | mix | mix_isp | resident | scraper.
 	SectionCode string `json:"sectionCode"`
@@ -2309,9 +2301,9 @@ type OrderRequest struct {
 	Authorization    string `json:"authorization,omitempty"`
 	CustomTargetName string `json:"customTargetName,omitempty"`
 	// MixID — ObjectId of the MIX package OR its tag; both come from reference/list/mix
-	// (quantities[].id and country[].tag).
+	// (quantities[].id).
 	MixID string `json:"mixId,omitempty"`
-	// MixCode — MIX package tag, available as country[].tag under mix / mix_isp.
+	// MixCode — MIX package code, available as quantities[].id under mix / mix_isp.
 	MixCode  string `json:"mixCode,omitempty"`
 	Uptime   bool   `json:"uptime,omitempty"`
 	Protocol string `json:"protocol,omitempty"`

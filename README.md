@@ -157,7 +157,7 @@ Every `*Id` field of an order takes **the readable code** — `USA`, `1m`, `euro
 ```go
 calc, err := client.CalculateOrder(api.OrderRequest{
     SectionCode: "mobile",
-    CountryID: "USA",  // alpha3, uppercased by the server
+    CountryID: "USA",  // country[].id from the reference, uppercased by the server
     PeriodID: "1m",    // period code, lowercased by the server
     Quantity: 1,
     MobileServiceType: "dedicated", // shared or dedicated; required for mobile
@@ -188,16 +188,16 @@ The `*Code` fields (`CountryCode`, `PeriodCode`, `OperatorCode`, `MixCode`, `Tar
 
 ### What you can pass, and where to get it
 
-`reference/list` gives you a readable code for every field. Read it, pass the code straight into the request field — there is no id to look up:
+Every field in the reference is called `id`, and its value is a readable code — not an ObjectId. Read `id`, put it in the matching `*Id` argument. That is the whole rule:
 
 | Request field | Pass this | Read it from |
 |---|---|---|
-| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `reference/list` → `country[].alpha3` |
-| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `reference/list` → `period[].code` |
-| `operatorId` | mobile operator tag — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `tag` |
-| `rotationId` | **minutes as an integer**, `0` = By Link. The one field with no code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
-| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].tag`, e.g. `europe-2-mix_IPv4`. `OrderCalcMix`/`OrderMakeMix` take it as the first argument |
-| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].code` |
+| `countryId` | alpha-3 country code, e.g. `USA` (upper-cased server-side, so `usa` works) | `reference/list` → `country[].id` |
+| `periodId` | period code, e.g. `1m` (lower-cased server-side) | `reference/list` → `period[].id` |
+| `operatorId` | mobile operator code — exact match, case-sensitive | `reference/list/mobile` → `country[].operators.dedicated[]` / `.shared[]` → `id` |
+| `rotationId` | **minutes as an integer**, `0` = By Link — the one `id` that is a number, not a code | `reference/list/mobile` → `country[].operators.*[].rotations[].id` — that value *is* the minute count (`name` is `"5 minutes"` / `"By Link"`) |
+| `mixId` | mix package code — exact match | `reference/list/mix` → `quantities[].id`, e.g. `europe-2-mix_IPv4`. `OrderCalcMix`/`OrderMakeMix` take it as the first argument |
+| `tarifId` | resident tariff code — exact match, e.g. `1-gb` | `reference/list/resident` → `tarifs[].id` |
 | `paymentId` | payment-system ObjectId — the one unavoidable id | `balance/payments/list` → `id` (see [Paying for orders](#paying-for-orders)) |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer publishes them. Code resolution happens in `order/calc`, `order/make`, `prolong/calc` and `prolong/make`.
