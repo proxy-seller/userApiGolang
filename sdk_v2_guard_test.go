@@ -580,7 +580,9 @@ func TestSplitProlongTargets(t *testing.T) {
 		wantIDs []string
 	}{
 		{"ipv4", []string{"1.2.3.4", "5.6.7.8"}, []string{"1.2.3.4", "5.6.7.8"}, nil},
-		{"ipv6 host:port", []string{"2001:db8::1:8080"}, []string{"2001:db8::1:8080"}, nil},
+		// Любая строка с двоеточием уходит в ips — и адрес ipv6 (в поле "ip" уже шлюз с портом,
+		// "1.2.3.4:26000"), и mobile-тройка.
+		{"colon address", []string{"2001:db8::1:8080"}, []string{"2001:db8::1:8080"}, nil},
 		{"mobile triple", []string{"10.0.0.1:8000:9000"}, []string{"10.0.0.1:8000:9000"}, nil},
 		{"objectids", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, nil, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
 		{"mixed", []string{"1.2.3.4", "68b1f0c4e13a4c0f1a2b3c4d"}, []string{"1.2.3.4"}, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},

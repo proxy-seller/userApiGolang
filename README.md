@@ -266,15 +266,18 @@ order, err := client.ProlongMake("ipv4", ips, "1m", "") // deducts money
 
 `ProlongCalc` shows the price; `ProlongMake` charges the balance. If the balance is short, `ProlongMake` returns an `*APIError` with the server's warning — it never reports a renewal that did not happen.
 
-The address format follows the proxy type, exactly as it comes back from `ListProxies`:
+What you pass follows the proxy type, and every field below is one `ListProxies` publishes:
 
-| type | address |
-|---|---|
-| `ipv4`, `isp`, `mix` | `1.2.3.4` |
-| `ipv6` | `host:port` |
-| `mobile` | `ip:portHttp:portSocks` |
+| type | pass | built from | example |
+|---|---|---|---|
+| `ipv4`, `isp`, `mix`, `mix_isp` | the address | `ip` | `1.2.3.4` |
+| `ipv6` | the address | `ip` | `1.2.3.4:26000` |
+| `mobile` | the address | `ip` + `:` + `port_http` + `:` + `port_socks` | `10.0.0.1:50100:50101` |
 
-ObjectId strings still work, and a mixed slice works too — each value is routed by its shape.
+For `ipv6` the `ip` field already contains the gateway together with the port (`1.2.3.4:26000`),
+while `ip_only` holds the gateway alone — so pass `ip` as it comes, exactly like every other type.
+
+ObjectId strings work for every type, and a mixed slice works too — each value is routed by its shape.
 
 ## Prolong, proxy and resident options
 

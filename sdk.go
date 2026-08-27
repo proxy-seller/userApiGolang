@@ -1483,8 +1483,8 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 //	'order_id' => '68b1f0c4e13a4c0f1a2b3c11',
 //	'order_number' => 'LH-100500',
 //	'basket_id' => '68b1f0c4e13a4c0f1a2b3c22',
-//	'ip' => 127.0.0.2,
-//	'ip_only' => 127.0.0.2,
+//	'ip' => 127.0.0.2,       // for ipv6 this is the gateway WITH its port: "1.2.3.4:26000"
+//	'ip_only' => 127.0.0.2,  // for ipv6, the gateway alone
 //	'protocol' => 'HTTP',
 //	'port_socks' => 50101,
 //	'port_http' => 50100,
@@ -2124,9 +2124,12 @@ func (c *Client) ResidentsubuserListTools(package_key string) (map[string]interf
 // Клиенту удобнее всего продлевать по самим адресам — именно их он видит
 // в proxy/list и в выгрузке. Сервер принимает их в поле ips и сам переводит в ids
 // (ClientApiService.resolveProlongIpsToIds — вызывается безусловно и для calc, и для make).
-// Формат адреса зависит от типа: ipv4/isp/mix — "ip", ipv6 — "host:port",
-// mobile — "ip:portHttp:portSocks". ObjectId — 24 hex-символа без точек и двоеточий,
-// поэтому одно от другого отличается надёжно и смешанный список тоже работает.
+// Формат адреса зависит от типа: ipv4/isp/mix/mix_isp — "ip", mobile — "ip:port_http:port_socks"
+// (оба порта есть в proxy/list). Для ipv6 — тоже "ip": там уже лежит шлюз с портом
+// ("1.2.3.4:26000"), а "ip_only" — только шлюз, так что строка, которую сверяет сервер
+// (OldSellerService.formatIpForType), передаётся как есть.
+// ObjectId — 24 hex-символа без точек и двоеточий, поэтому одно от другого отличается
+// надёжно и смешанный список тоже работает.
 func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
 	var items []string
 	switch value := ipsOrIds.(type) {
@@ -2202,8 +2205,10 @@ func normalizeIDs(ids interface{}) interface{} {
 // ProlongCalc Calculate the renewal
 // @param proxyType - ipv4 | ipv6 | mobile | isp | mix
 // @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
-// for ipv4/isp/mix, "host:port" for ipv6, "ip:portHttp:portSocks" for mobile. ObjectId strings
-// are accepted too, and a mixed slice works — each value is routed by shape (splitProlongTargets).
+// for ipv4/isp/mix/mix_isp, ip + ":" + port_http + ":" + port_socks for mobile. For ipv6 the "ip"
+// field already carries the gateway together with the port ("1.2.3.4:26000") while "ip_only" holds
+// the gateway alone, so pass "ip" as it comes, like every other type. ObjectId strings are accepted
+// for every type, and a mixed slice works — each value is routed by shape (splitProlongTargets).
 // @param periodId - ObjectId string OR the period code ("1m"): prolong resolves a non-id value as a
 // code exactly like order/* (ClientApiService.normalizeProlongReferenceCodes)
 func ProlongCalc(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
@@ -2218,8 +2223,10 @@ func (c *Client) ProlongCalc(proxyType string, ipsOrIds interface{}, periodId st
 // ProlongMake Create a renewal order. Attention! Deducts money from the balance.
 // @param proxyType - ipv4 | ipv6 | mobile | isp | mix
 // @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
-// for ipv4/isp/mix, "host:port" for ipv6, "ip:portHttp:portSocks" for mobile. ObjectId strings
-// are accepted too, and a mixed slice works — each value is routed by shape (splitProlongTargets).
+// for ipv4/isp/mix/mix_isp, ip + ":" + port_http + ":" + port_socks for mobile. For ipv6 the "ip"
+// field already carries the gateway together with the port ("1.2.3.4:26000") while "ip_only" holds
+// the gateway alone, so pass "ip" as it comes, like every other type. ObjectId strings are accepted
+// for every type, and a mixed slice works — each value is routed by shape (splitProlongTargets).
 // @param periodId - ObjectId string OR the period code ("1m")
 func ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	return legacyClient().ProlongMake(proxyType, ipsOrIds, periodId, coupon)
@@ -2508,9 +2515,10 @@ func (c *Client) SetProxyComment(ids []string, comment string) (map[string]inter
 // prolong accepts.
 type ProlongRequest struct {
 	IDs []string `json:"ids,omitempty"`
-	// IPs — сами адреса вместо ObjectId: ipv4/isp/mix — "ip", ipv6 — "host:port",
-	// mobile — "ip:portHttp:portSocks". Сервер сам резолвит их в IDs. Если заполнены оба
-	// поля, сервер берёт IDs.
+	// IPs — сами адреса вместо ObjectId: ipv4/isp/mix/mix_isp — "ip",
+	// mobile — "ip:port_http:port_socks", ipv6 — тоже "ip", в котором уже есть шлюз с портом
+	// ("1.2.3.4:26000"; "ip_only" — только шлюз). Сервер сам резолвит адреса в IDs.
+	// Если заполнены оба поля, сервер берёт IDs.
 	IPs               []string `json:"ips,omitempty"`
 	OrderSeparatorIDs []string `json:"orderSeparatorIds,omitempty"`
 	OrderSeparatorID  string   `json:"orderSeparatorId,omitempty"`
