@@ -15,6 +15,10 @@ import (
 
 const DefaultBaseURL = "https://proxy-seller.com/personal/api/v2/"
 
+// FingerprintHeader — имя заголовка отпечатка установки, объявленного в контракте
+// (components.parameters.Fingerprint). См. WithFingerprint.
+const FingerprintHeader = "X-Fingerprint"
+
 // URL is kept for source compatibility. New code should use WithBaseURL.
 var URL = DefaultBaseURL
 
@@ -25,6 +29,7 @@ type Client struct {
 	paymentID    string
 	paymentCode  string
 	generateAuth string
+	fingerprint  string
 	httpClient   *http.Client
 }
 
@@ -32,6 +37,20 @@ type ClientOption func(*Client)
 
 func WithBaseURL(baseURL string) ClientOption {
 	return func(c *Client) { c.baseURL = normalizeBaseURL(baseURL) }
+}
+
+// WithFingerprint задаёт значение заголовка X-Fingerprint для order/make.
+//
+// Контракт объявляет заголовок обязательным на всей операции order/make, но реально его
+// требуют только резидентские и скраперные заказы: OrderService отвечает
+// "Header X-Fingerprint is required" и не создаёт заказ вовсе. Прочие секции заголовок
+// игнорируют, поэтому SDK шлёт его всегда, когда значение задано.
+//
+// Значение по форме не проверяется ("any opaque string is accepted") — важна только его
+// стабильность в пределах установки клиента. SDK НЕ генерирует его сам: случайное значение
+// на процесс ломает анти-фрод и affiliate-атрибуцию, ради которых заголовок и введён.
+func WithFingerprint(fingerprint string) ClientOption {
+	return func(c *Client) { c.fingerprint = strings.TrimSpace(fingerprint) }
 }
 
 func WithHTTPClient(httpClient *http.Client) ClientOption {
@@ -153,7 +172,7 @@ type APIErrorItem struct {
 	Code    APIErrorCode `json:"code"`
 	// CustomData — свободная полезная нагрузка ошибки. Заполняется, например,
 	// balance/autotopup/set: там сюда уезжают границы значений
-	// (minAmount / minThreshold / minDailyCountCap), см. AutoTopupLimitsFromError.
+	// (minAmount / minThreshold), см. AutoTopupLimitsFromError.
 	CustomData interface{} `json:"customData,omitempty"`
 }
 
@@ -309,6 +328,22 @@ func GetGenerateAuth() string {
 
 func (c *Client) GetGenerateAuth() string { c.mu.RLock(); defer c.mu.RUnlock(); return c.generateAuth }
 
+// SetFingerprint X-Fingerprint value of this installation (see WithFingerprint).
+// Стабильная непрозрачная строка; SDK её не генерирует и по форме не проверяет.
+func SetFingerprint(fingerprint string) {
+	DefaultClient.SetFingerprint(fingerprint)
+}
+
+func (c *Client) SetFingerprint(fingerprint string) {
+	c.mu.Lock()
+	c.fingerprint = strings.TrimSpace(fingerprint)
+	c.mu.Unlock()
+}
+
+func GetFingerprint() string { return DefaultClient.GetFingerprint() }
+
+func (c *Client) GetFingerprint() string { c.mu.RLock(); defer c.mu.RUnlock(); return c.fingerprint }
+
 func tryConvert(i interface{}) ResultData {
 	result := NewResultData()
 	result.Value = i
@@ -362,7 +397,14 @@ func (c *Client) snapshot() (string, string, *http.Client, error) {
 }
 
 func (c *Client) Request(method, uri string, data interface{}) (ResultData, error) {
-	body, status, err := c.do(method, uri, data)
+	return c.RequestWithHeaders(method, uri, data, nil)
+}
+
+// RequestWithHeaders — тот же запрос с дополнительными заголовками поверх Content-Type.
+// Нужен для X-Fingerprint на order/make; пустые имена и значения пропускаются, чтобы
+// незаданный отпечаток не уезжал пустым заголовком.
+func (c *Client) RequestWithHeaders(method, uri string, data interface{}, headers map[string]string) (ResultData, error) {
+	body, status, err := c.doWithHeaders(method, uri, data, headers)
 	if err != nil {
 		return NewResultData(), err
 	}
@@ -370,6 +412,10 @@ func (c *Client) Request(method, uri string, data interface{}) (ResultData, erro
 }
 
 func (c *Client) do(method, uri string, data interface{}) ([]byte, int, error) {
+	return c.doWithHeaders(method, uri, data, nil)
+}
+
+func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map[string]string) ([]byte, int, error) {
 	baseURL, key, httpClient, err := c.snapshot()
 	if err != nil {
 		return nil, 0, err
@@ -403,6 +449,12 @@ func (c *Client) do(method, uri string, data interface{}) ([]byte, int, error) {
 	}
 	if reader != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		if name == "" || value == "" {
+			continue
+		}
+		req.Header.Set(name, value)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -658,11 +710,15 @@ func (c *Client) BalancePaymentsList() ([]interface{}, error) {
 // вообще не попадает в запрос, а не уезжает как null (null сервер трактовал бы как "прислали
 // пустое значение" и валидация мержа могла бы отбить весь запрос).
 //
-// Границы значений (минимальная сумма, минимальный порог, минимальный дневной лимит) при
-// ошибке валидации приходят в errors[0].customData — см. AutoTopupLimitsFromError.
+// Границы значений (минимальная сумма, минимальный порог) при ошибке валидации приходят
+// в errors[0].customData — см. AutoTopupLimitsFromError.
 // Коды ошибок авто-пополнения: 49 disabled, 50 min threshold, 51 min amount,
-// 52 amount below threshold, 53 no payment method, 54 min daily count cap,
-// 55 monthly cap below amount, 56 payment method invalid.
+// 52 amount below threshold, 53 no payment method, 56 payment method invalid.
+//
+// Полей dailyCountCap и monthlyAmountCap здесь БОЛЬШЕ НЕТ: 18.08.2026 их убрали из
+// AutoTopupSetRequestClientDto, присланные сервер игнорирует. Коды 54 и 55 удалены и не
+// переиспользуются. Раньше SDK их объявлял, проверял и отправлял — вызов с ними проходил
+// локальный гейт, возвращал success и не делал ничего.
 type AutoTopupSetRequest struct {
 	// Enabled — включить/выключить. Не задано — состояние не меняется.
 	Enabled *bool `json:"enabled,omitempty"`
@@ -673,10 +729,6 @@ type AutoTopupSetRequest struct {
 	// SubscriptionID — подписка Paddle, которой списывать; это paymentMethod.id либо
 	// subscriptionId из ответа balance/autotopup/get.
 	SubscriptionID *string `json:"subscriptionId,omitempty"`
-	// DailyCountCap — свой (более строгий) лимит числа списаний в сутки.
-	DailyCountCap *int `json:"dailyCountCap,omitempty"`
-	// MonthlyAmountCap — свой лимит суммы списаний за 30 дней.
-	MonthlyAmountCap *float64 `json:"monthlyAmountCap,omitempty"`
 }
 
 // AutoTopupPaymentMethod — привязанный платёжный метод (AutoTopupPaymentMethodClientDto).
@@ -715,13 +767,11 @@ type AutoTopupState struct {
 	Enabled    bool `json:"enabled"`
 	// State — NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID | PAUSED_FAILURES
 	// (enum AutoTopupState на сервере).
-	State            string                  `json:"state,omitempty"`
-	Threshold        *float64                `json:"threshold,omitempty"`
-	Amount           *float64                `json:"amount,omitempty"`
-	SubscriptionID   string                  `json:"subscriptionId,omitempty"`
-	PaymentMethod    *AutoTopupPaymentMethod `json:"paymentMethod,omitempty"`
-	DailyCountCap    *int                    `json:"dailyCountCap,omitempty"`
-	MonthlyAmountCap *float64                `json:"monthlyAmountCap,omitempty"`
+	State          string                  `json:"state,omitempty"`
+	Threshold      *float64                `json:"threshold,omitempty"`
+	Amount         *float64                `json:"amount,omitempty"`
+	SubscriptionID string                  `json:"subscriptionId,omitempty"`
+	PaymentMethod  *AutoTopupPaymentMethod `json:"paymentMethod,omitempty"`
 	// FailCount — подряд идущие неудачные попытки списания.
 	FailCount int `json:"failCount"`
 	// LastAttemptAt — java.util.Date с сервера; SDK не парсит (см. AutoTopupLastEvent.At).
@@ -730,12 +780,12 @@ type AutoTopupState struct {
 }
 
 // AutoTopupLimits — границы значений из errors[].customData ответа balance/autotopup/set.
-// Ключи задаёт ClientApiService.setAutoTopup: minAmount, minThreshold, minDailyCountCap.
-// Присутствуют только те, что относятся к сработавшей проверке.
+// Ключи задаёт ClientApiService.setAutoTopup: minAmount, minThreshold. Присутствуют только те,
+// что относятся к сработавшей проверке. Ключа minDailyCountCap больше нет — дневной лимит
+// удалён из контракта вместе с полем dailyCountCap.
 type AutoTopupLimits struct {
-	MinAmount        *float64
-	MinThreshold     *float64
-	MinDailyCountCap *int
+	MinAmount    *float64
+	MinThreshold *float64
 }
 
 // AutoTopupLimitsFromError достаёт границы из ошибки balance/autotopup/set.
@@ -757,10 +807,6 @@ func AutoTopupLimitsFromError(err error) (AutoTopupLimits, bool) {
 		}
 		if value, exists := autoTopupLimitFloat(data, "minThreshold"); exists {
 			limits.MinThreshold, found = &value, true
-		}
-		if value, exists := autoTopupLimitFloat(data, "minDailyCountCap"); exists {
-			intValue := int(value)
-			limits.MinDailyCountCap, found = &intValue, true
 		}
 	}
 	return limits, found
@@ -831,8 +877,9 @@ func decodeAutoTopupState(endpoint string, result ResultData) (*AutoTopupState, 
 	return state, nil
 }
 
-// Bool, Float64, Int and String build pointers for AutoTopupSetRequest, where a missing
-// field means "keep the stored value" and must not be sent as null.
+// Bool, Float64, Int and String build pointers for the partial-update request structs
+// (AutoTopupSetRequest, ResidentSubuserCreateRequest, ResidentSubuserUpdateRequest), where a
+// missing field means "keep the stored value" and must not be sent as null.
 func Bool(value bool) *bool          { return &value }
 func Float64(value float64) *float64 { return &value }
 func Int(value int) *int             { return &value }
@@ -846,6 +893,15 @@ func String(value string) *string    { return &value }
 // - Proxy periods
 // - Purposes and services (only for ipv4,ipv6,isp,mix,mix_isp,resident)
 // - Quantities allowed (only for mix proxy)
+//
+// ФОРМА data У ДВУХ МАРШРУТОВ РАЗНАЯ, и это не опечатка сервера:
+//
+//	reference/list/{type} → data.items — ОБЪЕКТ одного типа: {"items":{"country":[…],"period":[…]}}
+//	reference/list        → data без обёртки, ключи — сами типы: {"ipv4":{…},"mobile":{…},…}
+//
+// То есть со вторым аргументом справочник лежит в result.Map["items"], а без него — прямо в
+// result.Map под именем типа. Чтения "как будто обёртки нет" на типизированном маршруте
+// (result.Map["country"]) дают nil.
 //
 // What the reference really carries, field by field (ClientApiService.buildLegacyReferenceItem):
 //
@@ -1461,12 +1517,46 @@ func (c *Client) withGenerateAuth(data map[string]interface{}) map[string]interf
 	return data
 }
 
+// requiresFingerprint — секции, для которых сервер без X-Fingerprint заказ НЕ создаёт:
+// OrderService.createResidentOrder / createScraperOrder резолвят отпечаток из заголовка и
+// отвечают "Header X-Fingerprint is required". Остальные секции его игнорируют.
+func requiresFingerprint(sectionCode string) bool {
+	switch strings.TrimSpace(sectionCode) {
+	case "resident", "scraper":
+		return true
+	}
+	return false
+}
+
+// orderMakeHeaders — заголовки order/make: X-Fingerprint, когда значение задано (для ЛЮБОЙ
+// секции — слать его всегда безопасно), и локальный отказ, когда оно не задано, а заказ
+// резидентский либо скраперный. Проверяем до запроса, как и остальные обязательные поля:
+// без отпечатка такой заказ гарантированно не создастся.
+func (c *Client) orderMakeHeaders(sectionCode string, override string) (map[string]string, error) {
+	fingerprint := strings.TrimSpace(override)
+	if fingerprint == "" {
+		fingerprint = c.GetFingerprint()
+	}
+	if fingerprint == "" {
+		if requiresFingerprint(sectionCode) {
+			return nil, fmt.Errorf("order/make: X-Fingerprint is required for %s orders (the server replies \"Header X-Fingerprint is required\" and creates nothing): set a stable identifier of this installation with NewClient(key, WithFingerprint(...)) or SetFingerprint(...), or pass OrderRequest.Fingerprint for a single call", strings.TrimSpace(sectionCode))
+		}
+		return nil, nil
+	}
+	return map[string]string{FingerprintHeader: fingerprint}, nil
+}
+
 // Create an order
 func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{}, error) {
 	if err := requireCustomTargetName(data); err != nil {
 		return nil, err
 	}
-	result, err := c.Request(http.MethodPost, "order/make", c.withGenerateAuth(data))
+	section, _ := data["sectionCode"].(string)
+	headers, err := c.orderMakeHeaders(section, "")
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.withGenerateAuth(data), headers)
 	return result.Map, err
 }
 
@@ -1476,6 +1566,10 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 // @param string proxyType - ipv4 | ipv6 | mobile | isp | mix | ""
 // id, order_id, order_number and basket_id are ObjectId strings (ProxyListItemClientDto
 // declares all of them as String) — never parse them as numbers.
+//
+// Порты — ВСЕГДА строки, как в v1: ProxyListItemClientDto.port_socks / port_http объявлены
+// String, и у адреса без порта (например ipv6) приходит "", а не null и не 0. rotation, наоборот,
+// число: Integer, то есть int|null — интервал ротации мобильного прокси в минутах.
 // @return array Example
 // [
 //
@@ -1486,12 +1580,12 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 //	'ip' => 127.0.0.2,       // for ipv6 this is the gateway WITH its port: "1.2.3.4:26000"
 //	'ip_only' => 127.0.0.2,  // for ipv6, the gateway alone
 //	'protocol' => 'HTTP',
-//	'port_socks' => 50101,
-//	'port_http' => 50100,
+//	'port_socks' => '50101', // string, "" when the address has no SOCKS5 port
+//	'port_http' => '50100',  // string, "" when the address has no HTTP port
 //	'login' => 'login',
 //	'password' => 'password',
 //	'auth_ip' => '',
-//	'rotation' => '',
+//	'rotation' => 60,        // int|null, minutes; null for non-mobile
 //	'link_reboot' => '#',
 //	'country' => 'France',
 //	'country_alpha3' => 'FRA',
@@ -1718,7 +1812,9 @@ func (c *Client) ResidentsubuserPackages() ([]interface{}, error) {
 //
 // @param integer rotation -1...3600
 // @param integer traffic_limit - in bytes (sent as a string, the server field is String)
-// @param string expired_at
+// @param string expired_at - "" не отправляется вовсе: сервер отличает отсутствие поля от
+// присланного значения, и пустая строка означала бы "менять дату", а не "не задано".
+// @param options - необязательные поля, которых нет в позиционной подписи (WithSubuserLinkDate)
 // @return array Example (expired_at приходит объектом PHP-даты, см. ResidentsubuserPackages)
 // [
 //
@@ -1730,18 +1826,43 @@ func (c *Client) ResidentsubuserPackages() ([]interface{}, error) {
 //	'expired_at': ['date' => '2025-12-31 23:59:59.000000', 'timezone_type' => 3, 'timezone' => 'UTC']
 //
 // ]
-func ResidentsubuserCreate(rotation int, traffic_limit int, expired_at string) (map[string]interface{}, error) {
-	return legacyClient().ResidentsubuserCreate(rotation, traffic_limit, expired_at)
+func ResidentsubuserCreate(rotation int, traffic_limit int, expired_at string, options ...ResidentSubuserOption) (map[string]interface{}, error) {
+	return legacyClient().ResidentsubuserCreate(rotation, traffic_limit, expired_at, options...)
 }
 
-func (c *Client) ResidentsubuserCreate(rotation int, traffic_limit int, expired_at string) (map[string]interface{}, error) {
-	data := map[string]interface{}{
-		"rotation":      rotation,
-		"traffic_limit": fmt.Sprint(traffic_limit),
-		"expired_at":    expired_at,
+func (c *Client) ResidentsubuserCreate(rotation int, traffic_limit int, expired_at string, options ...ResidentSubuserOption) (map[string]interface{}, error) {
+	applied := newResidentSubuserOptions(options)
+	return c.CreateResidentSubuser(ResidentSubuserCreateRequest{
+		Rotation:     &rotation,
+		TrafficLimit: fmt.Sprint(traffic_limit),
+		ExpiredAt:    strings.TrimSpace(expired_at),
+		IsLinkDate:   applied.isLinkDate,
+	})
+}
+
+// ResidentSubuserOption — необязательное поле легаси-обёрток residentsubuser/create и
+// residentsubuser/update, которого нет в их позиционной подписи. Весь набор полей доступен
+// напрямую в CreateResidentSubuser / UpdateResidentSubuser.
+type ResidentSubuserOption func(*residentSubuserOptions)
+
+type residentSubuserOptions struct {
+	isLinkDate *bool
+}
+
+func newResidentSubuserOptions(options []ResidentSubuserOption) residentSubuserOptions {
+	applied := residentSubuserOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&applied)
+		}
 	}
-	result, err := c.Request(http.MethodPost, "residentsubuser/create", data)
-	return result.Map, err
+	return applied
+}
+
+// WithSubuserLinkDate — is_link_date: привязать дату окончания субпакета к родительскому
+// пакету. Не задано — сервер поле не трогает.
+func WithSubuserLinkDate(linkDate bool) ResidentSubuserOption {
+	return func(options *residentSubuserOptions) { options.isLinkDate = &linkDate }
 }
 
 // ResidentsubuserUpdate Update subpackage
@@ -1753,11 +1874,21 @@ func (c *Client) ResidentsubuserCreate(rotation int, traffic_limit int, expired_
 // 0 Every request
 // 1...3600 interval in seconds
 //
+// Обновление ЧАСТИЧНОЕ: сервер меняет только те поля, которые реально пришли в теле
+// (ResidentSubPackageService.updateSubPackage сверяет каждое с null). Поэтому обёртка не
+// отправляет expired_at, если он пуст, и traffic_limit, если он не положителен: раньше уезжали
+// "" и "0", и сервер трактовал их как присланные значения — пустая дата молча переносила
+// окончание субпакета на дату родительского, а "0" отбивался "Set [traffic_limit > 0]".
+// rotation и is_active позиционная подпись выразить как "не менять" не может, они уходят
+// всегда; чтобы изменить ровно одно поле, используйте UpdateResidentSubuser.
+//
 // @param integer rotation -1...3600
-// @param integer traffic_limit - in bytes (sent as a string, the server field is String)
-// @param string expired_at
+// @param integer traffic_limit - in bytes (sent as a string, the server field is String);
+// 0 и меньше — "не менять"
+// @param string expired_at - "" означает "не менять"
 // @param bool is_active
 // @param string package_key
+// @param options - необязательные поля, которых нет в позиционной подписи (WithSubuserLinkDate)
 // @return array Example (expired_at приходит объектом PHP-даты, см. ResidentsubuserPackages)
 // [
 //
@@ -1769,20 +1900,23 @@ func (c *Client) ResidentsubuserCreate(rotation int, traffic_limit int, expired_
 //	'expired_at': ['date' => '2025-12-31 23:59:59.000000', 'timezone_type' => 3, 'timezone' => 'UTC']
 //
 // ]
-func ResidentsubuserUpdate(rotation int, traffic_limit int, expired_at string, is_active bool, package_key string) (map[string]interface{}, error) {
-	return legacyClient().ResidentsubuserUpdate(rotation, traffic_limit, expired_at, is_active, package_key)
+func ResidentsubuserUpdate(rotation int, traffic_limit int, expired_at string, is_active bool, package_key string, options ...ResidentSubuserOption) (map[string]interface{}, error) {
+	return legacyClient().ResidentsubuserUpdate(rotation, traffic_limit, expired_at, is_active, package_key, options...)
 }
 
-func (c *Client) ResidentsubuserUpdate(rotation int, traffic_limit int, expired_at string, is_active bool, package_key string) (map[string]interface{}, error) {
-	data := map[string]interface{}{
-		"rotation":      rotation,
-		"traffic_limit": fmt.Sprint(traffic_limit),
-		"expired_at":    expired_at,
-		"is_active":     is_active,
-		"package_key":   package_key,
+func (c *Client) ResidentsubuserUpdate(rotation int, traffic_limit int, expired_at string, is_active bool, package_key string, options ...ResidentSubuserOption) (map[string]interface{}, error) {
+	applied := newResidentSubuserOptions(options)
+	request := ResidentSubuserUpdateRequest{
+		PackageKey: package_key,
+		Rotation:   &rotation,
+		ExpiredAt:  strings.TrimSpace(expired_at),
+		Active:     &is_active,
+		IsLinkDate: applied.isLinkDate,
 	}
-	result, err := c.Request(http.MethodPost, "residentsubuser/update", data)
-	return result.Map, err
+	if traffic_limit > 0 {
+		request.TrafficLimit = fmt.Sprint(traffic_limit)
+	}
+	return c.UpdateResidentSubuser(request)
 }
 
 // ResidentsubuserDelete Delete subpackage
@@ -2232,42 +2366,20 @@ func ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon
 	return legacyClient().ProlongMake(proxyType, ipsOrIds, periodId, coupon)
 }
 
+// Обёртки assertProlongMade здесь больше нет.
+//
+// Она писалась под прежнюю форму нехватки средств у prolong/make: status="error" с ПУСТЫМ
+// errors[] и calc-данными в data — такую общий разбор конверта отдавал как успех, и
+// несостоявшееся продление выглядело как состоявшееся. Теперь причина лежит в
+// errors[{code:16}] (ProlongMakeResponseClientDto.ofInsufficientFunds — BALANCE_LOW), то есть
+// parseEnvelope и так возвращает *APIError с этим кодом и с данными в APIError.Data.
+//
+// Единственным оставшимся эффектом обёртки было превращать ЛЕГИТИМНЫЙ status="success"
+// с пустым orderId в фальшивую ошибку, теряя total/balance/listBaseOrderNumbers уже ПОСЛЕ
+// списания денег. Поэтому она удалена, а не переписана.
 func (c *Client) ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ipsOrIds, periodId, coupon))
-	if err != nil {
-		return result.Map, err
-	}
-	return assertProlongMade(result.Map)
-}
-
-// assertProlongMade отделяет состоявшееся продление от несостоявшегося.
-//
-// При нехватке средств prolong/make отдаёт конверт status="error" с ПУСТЫМ errors[] и
-// calc-данными в data (ProlongMakeResponseClientDto.ofInsufficientFunds, ClientApiService:3185) —
-// ровно ту же форму, что легитимный warning у prolong/calc. Общий разбор конверта поэтому
-// возвращал такие данные как успех, и несписанное продление выглядело как списанное.
-// Признак успеха — непустой orderId (ProlongMakeDataClientDto), признак провала — warning.
-//
-// order/make этим не страдает: у OrderMakeResponseClientDto есть только ofSuccess/ofError,
-// и при ошибке errors[] всегда заполнен.
-func assertProlongMade(data map[string]interface{}) (map[string]interface{}, error) {
-	if data == nil {
-		return data, nil
-	}
-	if id, _ := data["orderId"].(string); strings.TrimSpace(id) != "" {
-		return data, nil
-	}
-	warning, _ := data["warning"].(string)
-	warning = strings.TrimSpace(warning)
-	if warning == "" {
-		warning = "prolong/make did not create an order (insufficient funds)"
-	}
-	return data, &APIError{
-		HTTPStatus: http.StatusOK,
-		Status:     "error",
-		Errors:     []APIErrorItem{{Message: warning, Code: "0"}},
-		Data:       data,
-	}
+	return result.Map, err
 }
 
 /////////////////////////////// Typed v2 API ///////////////////////////////
@@ -2282,8 +2394,10 @@ func assertProlongMade(data map[string]interface{}) (map[string]interface{}, err
 //	OrderRequest{SectionCode: "mobile", CountryID: "USA", PeriodID: "1m", Quantity: 1,
 //	    OperatorID: "68b1f0c4e13a4c0f1a2b3c4d", RotationID: "5"}
 //
-// The *Code fields remain for callers who prefer to be explicit; filling both is pointless, and
-// prepareOrder drops the id when the code of the same pair is set.
+// The *Code fields remain for callers who prefer to be explicit; filling both halves is pointless.
+// prepareOrder resolves such a pair exactly the way the server does — the code wins for
+// country/period/payment, the id wins for operator/rotation/mix/tarif — and drops the losing half
+// so the request carries a single unambiguous value.
 //
 // RotationID is the exception: it is neither an id nor a code, but the rotation interval in minutes.
 type OrderRequest struct {
@@ -2338,6 +2452,10 @@ type OrderRequest struct {
 	// id, name and personal.
 	TarifCode    string `json:"tarifCode,omitempty"`
 	GenerateAuth string `json:"generateAuth,omitempty"`
+	// Fingerprint — значение заголовка X-Fingerprint только для этого вызова MakeOrder;
+	// пустое значение берётся с клиента (WithFingerprint / SetFingerprint). В тело запроса
+	// не попадает: это заголовок, а не поле. order/calc заголовок не использует.
+	Fingerprint string `json:"-"`
 }
 
 func (c *Client) prepareOrder(order OrderRequest, makeOrder bool) OrderRequest {
@@ -2349,26 +2467,32 @@ func (c *Client) prepareOrder(order OrderRequest, makeOrder bool) OrderRequest {
 	if order.SectionCode == "mobile" && order.MobileServiceType == "" {
 		order.MobileServiceType = "dedicated"
 	}
-	if order.CountryCode != "" {
+	// Приоритет половин пары повторяет ClientApiService.normalizeOrderReferenceCodes и у
+	// разных пар РАЗНЫЙ. У payment/country/period ветка кода безусловна — код старше id.
+	// У operator/rotation/mix/tarif условие серверное: `if (code && !trimToNull(id))`, то есть
+	// код применяется, ТОЛЬКО когда парный id пуст, — там старше id. Раньше SDK чистил id во
+	// всех семи парах, и клиент, заполнивший обе половины, молча получал не тот пакет,
+	// оператора, ротацию или тариф, который выбрал бы сервер.
+	if strings.TrimSpace(order.CountryCode) != "" {
 		order.CountryID = ""
 	}
-	if order.PeriodCode != "" {
+	if strings.TrimSpace(order.PeriodCode) != "" {
 		order.PeriodID = ""
 	}
-	if order.PaymentCode != "" {
+	if strings.TrimSpace(order.PaymentCode) != "" {
 		order.PaymentID = ""
 	}
-	if order.MixCode != "" {
-		order.MixID = ""
+	if strings.TrimSpace(order.MixID) != "" {
+		order.MixCode = ""
 	}
-	if order.OperatorCode != "" {
-		order.OperatorID = ""
+	if strings.TrimSpace(order.OperatorID) != "" {
+		order.OperatorCode = ""
 	}
-	if order.RotationCode != "" {
-		order.RotationID = ""
+	if strings.TrimSpace(order.RotationID) != "" {
+		order.RotationCode = ""
 	}
-	if order.TarifCode != "" {
-		order.TarifID = ""
+	if strings.TrimSpace(order.TarifID) != "" {
+		order.TarifCode = ""
 	}
 	if makeOrder && order.GenerateAuth == "" {
 		order.GenerateAuth = c.generateAuth
@@ -2405,7 +2529,11 @@ func (c *Client) MakeOrder(order OrderRequest) (map[string]interface{}, error) {
 	if err := requireOrderTarget(order); err != nil {
 		return nil, err
 	}
-	result, err := c.Request(http.MethodPost, "order/make", c.prepareOrder(order, true))
+	headers, err := c.orderMakeHeaders(order.SectionCode, order.Fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.prepareOrder(order, true), headers)
 	return result.Map, err
 }
 
@@ -2459,19 +2587,29 @@ func (c *Client) ListProxies(proxyType string, options ProxyListOptions) (map[st
 type ProxyDownloadOptions struct {
 	// Ext — txt | csv | шаблон с %ip%/%port%/%login%/%user%/%password%/%protocol%/%rotation_link%.
 	// Ограничения см. assertExt: >250 символов либо CR/LF/'/'/'\' — голый HTTP 400 мимо конверта.
-	Ext   string
+	Ext string
+	// Proto — https | socks5. Маршрут proxy/download/resident его НЕ читает (см. MaxLine).
 	Proto string
 	// ListID — только для resident/subresident.
 	ListID string
 	// PackageKey работает ТОЛЬКО с proxyType == "subresident". На литеральном маршруте
 	// proxy/download/resident он игнорируется, и выгружается родительский пакет.
 	PackageKey string
-	Country    string
-	Ends       string
+	// Country и Ends — фильтры обычных типов; резидентский маршрут их тоже не читает.
+	Country string
+	Ends    string
+	// MaxLine — сколько строк отдать; ТОЛЬКО proxy/download/resident
+	// (ResidentUserController.downloadProxyList принимает его Integer'ом). Прочие типы
+	// параметр игнорируют, поэтому SDK шлёт его только для resident.
+	MaxLine int
 }
 
 // DownloadProxies — выгрузка прокси файлом. Ответ — attachment, а не конверт
 // {status,data,errors}; ошибки доступа при этом приходят конвертом и разбираются в APIError.
+//
+// proxy/download/resident — ЛИТЕРАЛЬНЫЙ маршрут, а не подстановка в {type}: он специфичнее
+// шаблона и перехватывает запрос на себя. Принимает только listId (алиас id), ext и maxLine —
+// proto, country и ends на нём молча выбрасываются.
 func (c *Client) DownloadProxies(proxyType string, options ProxyDownloadOptions) ([]byte, error) {
 	if err := assertExt(options.Ext); err != nil {
 		return nil, err
@@ -2497,6 +2635,9 @@ func (c *Client) DownloadProxies(proxyType string, options ProxyDownloadOptions)
 	}
 	if options.Ends != "" {
 		query.Set("ends", options.Ends)
+	}
+	if options.MaxLine > 0 && strings.EqualFold(strings.TrimSpace(proxyType), "resident") {
+		query.Set("maxLine", strconv.Itoa(options.MaxLine))
 	}
 	path := "proxy/download/" + url.PathEscape(proxyType)
 	if encoded := query.Encode(); encoded != "" {
@@ -2553,10 +2694,163 @@ func (c *Client) CalculateProlong(proxyType string, request ProlongRequest) (map
 
 func (c *Client) MakeProlong(proxyType string, request ProlongRequest) (map[string]interface{}, error) {
 	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), c.prepareProlong(request))
-	if err != nil {
-		return result.Map, err
+	return result.Map, err
+}
+
+/////////////////////////////// Autoprolong ///////////////////////////////
+
+// Платёжки, допустимые для автопродления (AUTO_PROLONG_PAYMENT_TYPES на сервере). Разовый
+// чекаут Paddle сюда не входит: он требует редиректа в браузер, а списание произойдёт без
+// клиента. Всё остальное сервер отбивает текстом
+// "Set [paymentId] from: balance / paddle_subscription".
+const (
+	AutoProlongPaymentBalance            = "balance"
+	AutoProlongPaymentPaddleSubscription = "paddle_subscription"
+)
+
+// AutoProlongRequest — тело autoprolong/calc|enable|disable/{type}.
+//
+// Наследует ProlongRequest ровно как AutoProlongRequestClientDto наследует
+// ProlongRequestClientDto: автопродление адресует те же прокси, что и ручное (IDs, IPs,
+// OrderSeparatorIDs, PeriodID/PeriodCode, PaymentID/PaymentCode), и резолв кодов на сервере
+// общий. Сверху добавлены только SubscriptionID и TarifID.
+//
+// Сервер принимает и snake-алиасы (payment_id, subscription_id, tarif_id, tariffId) с
+// приоритетом camelCase > snake_case; SDK всегда шлёт каноническое camelCase-написание.
+//
+// Coupon унаследован, но автопродление промокоды не применяет НИГДЕ — сервер его сознательно
+// не передаёт в расчёт, чтобы превью не показало цену, которой в день списания не будет.
+type AutoProlongRequest struct {
+	ProlongRequest
+	// SubscriptionID — подписка Paddle, которой списывать. Обязательна и осмысленна ТОЛЬКО
+	// когда платёжка резолвится в paddle_subscription; для balance игнорируется. Подписка
+	// должна принадлежать этому же аккаунту, иначе "Set existed [subscriptionId] from reference".
+	SubscriptionID string `json:"subscriptionId,omitempty"`
+	// TarifID — только резидентская ветка (type = resident); у обычных прокси вместо него
+	// PeriodID. Автопродление тариф не меняет, поэтому единственное принимаемое значение —
+	// код или id тарифа, который уже стоит на пакете: прислать его можно лишь чтобы
+	// подтвердить расчёт. Другой существующий тариф отбивается как
+	// "Set [tarifId] from package: <code>", неизвестный — "Set existed [tarifId] from reference".
+	TarifID string `json:"tarifId,omitempty"`
+}
+
+// assertAutoProlong повторяет те серверные проверки автопродления, ответ на которые известен
+// заранее: тип, который ручка не обслуживает, и платёжку, без которой списание невозможно.
+//
+// paymentRequired — только для calc и enable: списание произойдёт без клиента, поэтому
+// платёжную систему нельзя угадать (в отличие от prolong/calc, где paymentId необязателен).
+// disable ни периода, ни платёжки не требует — он их как раз сбрасывает.
+//
+// Список допустимых платёжек локально НЕ сверяется: значение может быть и ObjectId, и кодом
+// самой системы, который не обязан совпадать с именем типа, — такую проверку честно делает
+// только сервер. Проверяем отсутствие значения и подписку Paddle, когда тип назван явно.
+//
+// Проверять нужно УЖЕ подготовленное тело: prepareProlong подставляет платёжку клиента
+// (SetPaymentId / SetPaymentCode), и на сыром request проверка отбивала бы запрос, который
+// сервер принял бы.
+func assertAutoProlong(proxyType string, request AutoProlongRequest, paymentRequired bool) error {
+	if strings.EqualFold(strings.TrimSpace(proxyType), "scraper") {
+		return fmt.Errorf("autoprolong: scraper is extended by buying traffic through order/make, the server replies %q", "Create new order to add traffic, prolong options not available")
 	}
-	return assertProlongMade(result.Map)
+	if !paymentRequired {
+		return nil
+	}
+	payment := strings.TrimSpace(request.PaymentID)
+	if payment == "" {
+		payment = strings.TrimSpace(request.PaymentCode)
+	}
+	if payment == "" {
+		return fmt.Errorf("autoprolong: paymentId is required (the server replies \"Set [paymentId]\"), the charge happens while you are not there; allowed systems are %s and %s", AutoProlongPaymentBalance, AutoProlongPaymentPaddleSubscription)
+	}
+	if payment == AutoProlongPaymentPaddleSubscription && strings.TrimSpace(request.SubscriptionID) == "" {
+		return fmt.Errorf("autoprolong: subscriptionId is required for %s (the server replies \"Set [subscriptionId]\"), take it from balance/autotopup/get -> paymentMethod.id", AutoProlongPaymentPaddleSubscription)
+	}
+	return nil
+}
+
+func (c *Client) prepareAutoProlong(request AutoProlongRequest) AutoProlongRequest {
+	request.ProlongRequest = c.prepareProlong(request.ProlongRequest)
+	return request
+}
+
+// AutoProlongCalc Calculate the upcoming automatic extension charge
+// (POST autoprolong/calc/{type}). Ничего не меняет.
+// @param proxyType - ipv4 | ipv6 | mobile | isp | mix | resident
+func AutoProlongCalc(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	return legacyClient().CalculateAutoProlong(proxyType, request)
+}
+
+// CalculateAutoProlong — сколько спишется при автопродлении и КОГДА.
+//
+// Поля ответа: warning, balance, total, quantity, currency, discount, orders, items[],
+// days (null у резидентки), tarifId (только резидентка), chargeDate (null у резидентки),
+// dateEnd, paymentId, autoProlong. Даты — строки "yyyy-MM-dd HH:mm:ss".
+//
+// chargeDate — НЕ дата окончания: сервер держит два механизма автопродления, один списывает
+// за сутки до окончания, другой в сам день, и значение считается по включённому сейчас.
+// У резидентки chargeDate всегда null — пакет продлевается по дате ИЛИ по исчерпанию трафика,
+// одной датой это не выражается; там смотрите dateEnd.
+//
+// Нехватка баланса — не исключение: сервер отвечает status="error" с ЗАПОЛНЕННЫМ data и
+// ПУСТЫМ errors[] (та же форма, что у prolong/calc), поэтому метод возвращает данные с
+// заполненным warning и nil-ошибкой.
+//
+// У обычных прокси период обязателен (PeriodID либо PeriodCode), иначе
+// "Set existed [periodId] from reference". Для type = resident тело пакетное: PaymentID и
+// опционально TarifID, без IDs/IPs/PeriodID, а в ответе quantity = 1 и пустой ids.
+func (c *Client) CalculateAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	prepared := c.prepareAutoProlong(request)
+	if err := assertAutoProlong(proxyType, prepared, true); err != nil {
+		return nil, err
+	}
+	result, err := c.Request(http.MethodPost, "autoprolong/calc/"+url.PathEscape(proxyType), prepared)
+	return result.Map, err
+}
+
+// AutoProlongEnable Enable automatic extension for proxies
+// (POST autoprolong/enable/{type}). Деньги сейчас не списываются.
+func AutoProlongEnable(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	return legacyClient().EnableAutoProlong(proxyType, request)
+}
+
+// EnableAutoProlong включает автопродление и привязывает к прокси период и платёжку.
+//
+// Поля ответа: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
+//
+// quantity и ids — это то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 автопродление
+// включается целым заказом, поэтому один адрес включает их все.
+//
+// Для type = resident единица правки — пакет: достаточно PaymentID, в ответе quantity = 1 и
+// пустой ids. Этот вызов заменил удалённый resident/autorenew/enable.
+func (c *Client) EnableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	prepared := c.prepareAutoProlong(request)
+	if err := assertAutoProlong(proxyType, prepared, true); err != nil {
+		return nil, err
+	}
+	result, err := c.Request(http.MethodPost, "autoprolong/enable/"+url.PathEscape(proxyType), prepared)
+	return result.Map, err
+}
+
+// AutoProlongDisable Disable automatic extension for proxies
+// (POST autoprolong/disable/{type}).
+func AutoProlongDisable(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	return legacyClient().DisableAutoProlong(proxyType, request)
+}
+
+// DisableAutoProlong выключает автопродление и сбрасывает привязанные период и платёжку, так
+// что следующий enable обязан прислать их заново. Ни период, ни платёжка здесь не нужны —
+// только выбор прокси; для type = resident не нужно и его, адресуется пакет самого аккаунта.
+// Этот вызов заменил удалённый resident/autorenew/disable.
+//
+// В ответе days, paymentId и chargeDate — null, а dateEnd остаётся: прокси никуда не делись,
+// они просто перестали продлеваться сами.
+func (c *Client) DisableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
+	prepared := c.prepareAutoProlong(request)
+	if err := assertAutoProlong(proxyType, prepared, false); err != nil {
+		return nil, err
+	}
+	result, err := c.Request(http.MethodPost, "autoprolong/disable/"+url.PathEscape(proxyType), prepared)
+	return result.Map, err
 }
 
 type GeoFilter struct {

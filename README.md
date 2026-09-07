@@ -10,6 +10,19 @@ Base URL: `https://proxy-seller.com/personal/api/v2/` — the API key is a **pat
 go get github.com/proxy-seller/userApiGolang/v2
 ```
 
+> ⚠️ **This does not resolve yet.** The module path declares `/v2`, but the repository carries no
+> tags at all and the default branch (`main`) still declares the path without `/v2`, so the proxy
+> answers `no matching versions`. Until a `v2.x.x` tag is pushed on a branch whose `go.mod` says
+> `/v2`, depend on the branch explicitly — **keeping `/v2` in the path**:
+>
+> ```sh
+> go get github.com/proxy-seller/userApiGolang/v2@feature/client-api-v2
+> ```
+>
+> Dropping the `/v2` fails: the bare path and this branch's `go.mod` disagree, and the proxy
+> refuses with `go.mod has post-v0 module path ".../v2" at revision …`. With `/v2` it resolves
+> to the pseudo-version `v2.0.0-20260827082345-0949d38aa304`.
+
 ## Client configuration
 
 Prefer an explicit `Client`. Each instance has its own key, payment settings, base URL and HTTP client.
@@ -51,10 +64,24 @@ Every order and renewal needs a payment system. Take one from `BalancePaymentsLi
 
 ```go
 payments, _ := client.BalancePaymentsList()   // [{id: "69e7…", name: "PayPal"}, …]
-client.SetPaymentId(payments[0]["id"].(string))
+client.SetPaymentID(payments[0]["id"].(string))
 ```
 
 This is the one place where an id is unavoidable: several payment systems share the same internal code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code cannot tell them apart. Everywhere else you use human-readable codes.
+
+### Residential and scraper orders need a fingerprint
+
+`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and scraper orders are not created without it at all** — the order service answers `Header X-Fingerprint is required` and nothing is ordered.
+
+```go
+client := api.NewClient("YOUR_API_KEY", api.WithFingerprint("my-installation-id"))
+// or later:
+client.SetFingerprint("my-installation-id")
+```
+
+Any opaque string is accepted — the server does not validate its shape — but it must be a **stable identifier of your installation**. The SDK deliberately does not generate one: a value randomized per process would break the anti-fraud and affiliate attribution the header exists for.
+
+Ordering resident or scraper without a fingerprint fails locally with an explanatory error, rather than spending a round trip on a request the server is certain to reject.
 
 <details>
 <summary>Pointing the client at another host (local testing)</summary>
@@ -140,15 +167,17 @@ state, err = client.SetAutoTopup(api.AutoTopupSetRequest{
     Enabled:   api.Bool(true),
     Threshold: api.Float64(5),
     Amount:    api.Float64(25),
-    // SubscriptionID / DailyCountCap / MonthlyAmountCap left untouched
+    // SubscriptionID left untouched
 })
 
 if limits, ok := api.AutoTopupLimitsFromError(err); ok {
-    fmt.Println(limits.MinAmount, limits.MinThreshold, limits.MinDailyCountCap)
+    fmt.Println(limits.MinAmount, limits.MinThreshold)
 }
 ```
 
-`set` returns the state **after** saving, so no second request is needed. Auto top-up error codes: `49` feature disabled, `50` threshold too low, `51` amount too low, `52` amount below threshold, `53` no saved payment method, `54` daily cap too low, `55` monthly cap below a single top-up, `56` saved card invalid.
+`set` returns the state **after** saving, so no second request is needed. Auto top-up error codes: `49` feature disabled, `50` threshold too low, `51` amount too low, `52` amount below threshold, `53` no saved payment method, `56` saved card invalid.
+
+> **`DailyCountCap` and `MonthlyAmountCap` are gone.** Removed from the contract on 2026-08-18: the server silently ignores them and they are absent from the response, so sending them made a call that reported success and changed nothing. Error codes `54` and `55` went with them and are not reused, and `customData` no longer carries `minDailyCountCap`.
 
 ## Current order API
 
@@ -252,7 +281,7 @@ The legacy download helpers return a bare `string`/`[]byte` and swallow errors. 
 Renew by the addresses themselves — the same strings `ListProxies` gives you. No ids to look up:
 
 ```go
-list, _ := client.ListProxies("ipv4")
+list, _ := client.ListProxies("ipv4", api.ProxyListOptions{})
 items := list["items"].([]interface{})
 
 ips := make([]string, 0, len(items))
@@ -278,6 +307,42 @@ For `ipv6` the `ip` field already contains the gateway together with the port (`
 while `ip_only` holds the gateway alone — so pass `ip` as it comes, exactly like every other type.
 
 ObjectId strings work for every type, and a mixed slice works too — each value is routed by its shape.
+
+## Automatic renewal
+
+`ProlongMake` charges you now. `autoprolong/*` only arms a charge that happens later, without you present — a separate branch of the API, not a flag on prolong.
+
+```go
+req := api.AutoProlongRequest{}
+req.IPs = []string{"1.2.3.4"}
+req.PeriodID = "1m"
+req.PaymentID = "balance"                       // mandatory here
+
+client.CalculateAutoProlong("ipv4", req)        // what will be charged, and when
+client.EnableAutoProlong("ipv4", req)           // arm it
+client.DisableAutoProlong("ipv4", req)          // disarm it
+```
+
+`PaymentID` is **mandatory** for calc and enable — the charge happens while you are away, so the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a one-off Paddle checkout needs a browser redirect a headless client cannot complete. With `paddle_subscription` also set `SubscriptionID`.
+
+Residential packages renew as a package, not as addresses — send no selection, only the payment system and optionally `TarifID` to confirm the tariff already on the package:
+
+```go
+client.EnableAutoProlong("resident", api.AutoProlongRequest{
+    ProlongRequest: api.ProlongRequest{PaymentID: "balance"},
+    TarifID:        "trial",
+})
+```
+
+Three things about the answers before you parse them:
+
+* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and `ids` can cover more proxies than you sent.
+* **Not enough money is not an error return.** `calc` answers `status: "error"` with a *filled* `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `warning`.
+* **Residential fills different fields.** `days` and `chargeDate` are null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead.
+
+`scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
+
+> Replaces `resident/autorenew/{enable,disable,calculate}`, **removed** from the server.
 
 ## Prolong, proxy and resident options
 
@@ -307,6 +372,17 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 | `errors[].code` read as a number from an `interface{}` field | typed `APIErrorCode`, use `CodeInt()` |
 
 ## Changelog
+
+### v2.0.1 — catching up with the server
+
+- Added `CalculateAutoProlong` / `EnableAutoProlong` / `DisableAutoProlong` (and their package-level counterparts) for `autoprolong/{calc,enable,disable}/{type}`, with `AutoProlongRequest`. `PaymentID` is required on calc and enable and restricted to `balance` / `paddle_subscription`; `scraper` is rejected locally.
+- The server **removed** `resident/autorenew/{enable,disable,calculate}` — `type: "resident"` on the three endpoints above replaces them.
+- Added `X-Fingerprint` on `order/make`: `WithFingerprint(...)` / `SetFingerprint(...)`. Residential and scraper orders now fail locally when it is unset instead of being rejected by the server.
+- Removed `DailyCountCap` / `MonthlyAmountCap` from auto top-up (dropped from the contract 2026-08-18 and silently ignored), along with error codes `54`/`55` and `MinDailyCountCap`.
+- `MaxLine` is now sent on `proxy/download/resident` — the only route that accepts it. `Proto`, `Country` and `Ends` are no longer sent there, since that literal route ignores them.
+- `*Code` no longer overrides a paired `*Id` for `MixID`, `OperatorID`, `RotationID` and `TarifID`: the server applies the code on those four only while the id is empty, so the SDK was inverting the contract.
+- Fixed two README examples that did not compile (`SetPaymentId` → `SetPaymentID`, `ListProxies` takes `ProxyListOptions`).
+- Test suite repaired and extended. `go test ./...` had stopped compiling: `TestAutoTopupLimitsFromError` still referenced `MinDailyCountCap`, removed with the caps above. `TestProlongMakeInsufficientFundsIsAnError` still asserted the old insufficient-funds shape (`status:"error"` with an empty `errors[]`); the server now sends `errors[{code:16}]`, and the test covers that plus the case the removed guard used to break — a legitimate success with an empty `orderId` must keep `total` and `listBaseOrderNumbers`. Added `TestGenerateAuthPrecedence`: `OrderRequest.GenerateAuth` outranks `SetGenerateAuth()`, and neither is sent on `order/calc`, which drops the field.
 
 ### v2 (current)
 

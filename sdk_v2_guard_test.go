@@ -383,11 +383,12 @@ func TestAddBalanceRejectsPaymentCodeOnly(t *testing.T) {
 }
 
 // balance/autotopup/set — PARTIAL UPDATE: опущенное поле не должно уезжать как null.
+// Полей dailyCountCap и monthlyAmountCap в контракте больше нет (убраны 18.08.2026), их нет
+// ни в запросе, ни в ответе — присланные сервер игнорирует.
 func TestAutoTopupSetSendsOnlyProvidedFields(t *testing.T) {
 	var body string
 	state := `{"status":"success","data":{"configured":true,"enabled":true,"state":"ACTIVE",` +
-		`"threshold":5,"amount":10,"subscriptionId":"sub_1","dailyCountCap":3,` +
-		`"monthlyAmountCap":100,"failCount":0,` +
+		`"threshold":5,"amount":10,"subscriptionId":"sub_1","failCount":0,` +
 		`"paymentMethod":{"id":"sub_1","status":"active","paymentMethod":"card","brand":"visa","last4":"4242","exp":"12/2030"},` +
 		`"lastEvent":{"status":"SUCCEEDED","amount":10,"at":"2026-08-17T10:00:00.000+00:00"}},"errors":[]}`
 	client, _ := newTestClient(t, envelopeHandler(t, state, &body))
@@ -407,9 +408,6 @@ func TestAutoTopupSetSendsOnlyProvidedFields(t *testing.T) {
 	}
 	if got.LastEvent == nil || got.LastEvent.Status != "SUCCEEDED" {
 		t.Fatalf("lastEvent разобран неверно: %#v", got.LastEvent)
-	}
-	if got.DailyCountCap == nil || *got.DailyCountCap != 3 {
-		t.Fatalf("dailyCountCap разобран неверно: %#v", got.DailyCountCap)
 	}
 
 	// выключение — тоже одно поле, false обязан доехать (не отброситься omitempty)
@@ -445,10 +443,11 @@ func TestAutoTopupGetParsesState(t *testing.T) {
 }
 
 // Границы значений приходят в errors[0].customData (ClientApiService.setAutoTopup),
-// коды 49-56. Клиент обязан иметь к ним доступ.
+// коды 49-53 и 56 (54 и 55 удалены вместе с дневным и месячным лимитами). Клиент обязан
+// иметь к ним доступ.
 func TestAutoTopupLimitsFromError(t *testing.T) {
 	body := `{"status":"error","data":null,"errors":[{"message":"Top-up amount must be 5 or more","code":51,` +
-		`"customData":{"minAmount":5,"minThreshold":1,"minDailyCountCap":2}}]}`
+		`"customData":{"minAmount":5,"minThreshold":1}}]}`
 	_, err := parseEnvelope([]byte(body), http.StatusOK)
 	apiErr, ok := err.(*APIError)
 	if !ok {
@@ -467,9 +466,8 @@ func TestAutoTopupLimitsFromError(t *testing.T) {
 	if limits.MinThreshold == nil || *limits.MinThreshold != 1 {
 		t.Fatalf("minThreshold разобран неверно: %#v", limits.MinThreshold)
 	}
-	if limits.MinDailyCountCap == nil || *limits.MinDailyCountCap != 2 {
-		t.Fatalf("minDailyCountCap разобран неверно: %#v", limits.MinDailyCountCap)
-	}
+	// minDailyCountCap здесь больше не проверяется: ключ убран из контракта 18.08.2026
+	// вместе с самим лимитом, и в customData сервер отдаёт только minAmount и minThreshold.
 	if apiErr.FirstCustomData() == nil {
 		t.Fatal("FirstCustomData обязан отдавать customData")
 	}
@@ -526,24 +524,27 @@ func TestNormalizeIDs(t *testing.T) {
 	}
 }
 
-// prolong/make при нехватке средств отдаёт status="error" с ПУСТЫМ errors[] и calc-данными
-// в data (ProlongMakeResponseClientDto.ofInsufficientFunds, ClientApiService.groovy:3185) —
-// ту же форму, что легитимный warning у prolong/calc. Раньше parseEnvelope отдавал это как
-// успех, и несостоявшееся продление было неотличимо от состоявшегося.
+// prolong/make при нехватке средств кладёт причину в errors[{code:16}]
+// (ProlongMakeResponseClientDto.ofInsufficientFunds — BALANCE_LOW), поэтому её разбирает
+// общий parseEnvelope, и отдельной обёртки в SDK больше нет.
+//
+// Прежняя форма — status="error" с ПУСТЫМ errors[] — под которую эта обёртка писалась,
+// сервером не отдаётся. После смены формы единственным её эффектом осталось превращать
+// ЛЕГИТИМНЫЙ success с пустым orderId в фальшивую ошибку уже ПОСЛЕ списания денег.
 func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
-	insufficient := `{"status":"error","data":{"warning":"Insufficient funds. Total 3.0000. Not enough $7.00","balance":3,"total":10},"errors":[]}`
+	insufficient := `{"status":"error","data":null,"errors":[{"code":16,"message":"Insufficient funds on balance"}]}`
 
 	client, _ := newTestClient(t, envelopeHandler(t, insufficient, nil))
-	data, err := client.ProlongMake("ipv4", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, "1m", "")
+	_, err := client.ProlongMake("ipv4", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, "1m", "")
 	if err == nil {
 		t.Fatal("нехватка средств обязана возвращать ошибку, а не выглядеть успехом")
 	}
-	if !strings.Contains(err.Error(), "Not enough") {
-		t.Fatalf("текст warning должен попадать в ошибку, получено: %v", err)
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("ожидался *APIError, получено %T", err)
 	}
-	// данные конверта остаются доступны для разбора
-	if data == nil || data["balance"] == nil {
-		t.Fatalf("calc-данные должны возвращаться вместе с ошибкой, получено %#v", data)
+	if !apiErr.HasCode(16) {
+		t.Fatalf("код 16 (BALANCE_LOW) должен быть доступен, получено: %v", err)
 	}
 
 	// типизированный путь ведёт себя так же
@@ -553,9 +554,9 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 	}
 
 	// успешное продление по-прежнему проходит
-	ok := `{"status":"success","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d","total":10,"balance":90,"listBaseOrderNumbers":[]},"errors":[]}`
-	client3, _ := newTestClient(t, envelopeHandler(t, ok, nil))
-	data, err = client3.ProlongMake("ipv4", []string{"x"}, "1m", "")
+	okBody := `{"status":"success","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d","total":10,"balance":90,"listBaseOrderNumbers":[]},"errors":[]}`
+	client3, _ := newTestClient(t, envelopeHandler(t, okBody, nil))
+	data, err := client3.ProlongMake("ipv4", []string{"x"}, "1m", "")
 	if err != nil {
 		t.Fatalf("успешное продление не должно давать ошибку: %v", err)
 	}
@@ -563,10 +564,15 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 		t.Fatalf("orderId потерян: %#v", data)
 	}
 
-	// у prolong/calc тот же конверт — ЛЕГИТИМНЫЙ warning, ошибки быть не должно
-	client4, _ := newTestClient(t, envelopeHandler(t, insufficient, nil))
-	if _, err = client4.CalculateProlong("ipv4", ProlongRequest{IDs: []string{"x"}, PeriodID: "1m"}); err != nil {
-		t.Fatalf("prolong/calc warning не должен становиться ошибкой: %v", err)
+	// Деньги уже списаны: пустой orderId в успешном конверте терять total/balance нельзя.
+	emptyID := `{"status":"success","data":{"orderId":"","total":10,"balance":90,"listBaseOrderNumbers":["LH-1"]},"errors":[]}`
+	client4, _ := newTestClient(t, envelopeHandler(t, emptyID, nil))
+	data, err = client4.ProlongMake("ipv4", []string{"x"}, "1m", "")
+	if err != nil {
+		t.Fatalf("успех с пустым orderId не должен становиться ошибкой: %v", err)
+	}
+	if data["total"] == nil || data["listBaseOrderNumbers"] == nil {
+		t.Fatalf("данные списания потеряны: %#v", data)
 	}
 }
 
@@ -626,5 +632,36 @@ func TestOrderMixSendsMixId(t *testing.T) {
 	}
 	if got, present := data["countryId"]; present {
 		t.Fatalf("countryId must not be sent for a mix order, got %#v", got)
+	}
+}
+
+// generateAuth принимается ТОЛЬКО order/make: order/calc его молча отбрасывает, поэтому
+// подмешивать его в расчёт нельзя — иначе тело расчёта отличалось бы от тела заказа.
+//
+// Поле OrderRequest.GenerateAuth старше клиентского SetGenerateAuth: клиентское значение —
+// это умолчание на все заказы, а поле — решение для конкретного вызова. Остальные четыре
+// SDK ведут себя так же, и расхождение здесь означало бы, что один и тот же код на разных
+// языках создаёт разные заказы.
+func TestGenerateAuthPrecedence(t *testing.T) {
+	c := NewClient("test-key")
+	c.SetGenerateAuth("Y")
+	order := OrderRequest{SectionCode: "ipv4", CountryID: "USA", PeriodID: "1m", Quantity: 1}
+
+	if got := c.prepareOrder(order, false).GenerateAuth; got != "" {
+		t.Fatalf("order/calc: generateAuth = %q, не должен подмешиваться вовсе", got)
+	}
+	if got := c.prepareOrder(order, true).GenerateAuth; got != "Y" {
+		t.Fatalf("order/make без поля: generateAuth = %q, ожидалось значение клиента Y", got)
+	}
+
+	explicit := order
+	explicit.GenerateAuth = "N"
+	if got := c.prepareOrder(explicit, true).GenerateAuth; got != "N" {
+		t.Fatalf("явное поле = %q, оно обязано быть старше клиентского Y", got)
+	}
+
+	fresh := NewClient("test-key")
+	if got := fresh.prepareOrder(order, true).GenerateAuth; got != "N" {
+		t.Fatalf("умолчание клиента = %q, ожидалось N", got)
 	}
 }
