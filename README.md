@@ -244,6 +244,24 @@ ipv4, err := client.OrderCalcIpv4("USA", "1m", 1, "", "", "seo")
 
 `OrderCalcMobile`/`OrderMakeMobile` always send `mobileServiceType=dedicated`, and `OrderCalcMobile` no longer builds an IPv6 request. For shared mobile, MIX, uptime, scraper or other new combinations, use `OrderRequest`.
 
+### Listing orders
+
+```go
+orders, err := client.ListOrders(api.OrderListOptions{
+    Status: "PAYED",       // PAYED | NOT_PAYED | RETURN — the status_type of the response
+    SortBy: "date_insert", // date_insert | summ | status
+    Order:  "desc",
+    Page:   1,
+    Limit:  20,
+})
+
+all, err := client.OrderList() // the same call with no filters at all
+```
+
+Every filter is optional, and the wire names are the snake_case ones of v1 (`order_id`, `start_date`, `end_date`, `status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`) — the same endpoint answers legacy-API clients through the reverse mirror, so `OrderListOptions` keeps their spelling.
+
+`data` is not a flat list but a `metadata` + `items` pair, and `metadata` is always there: without `Limit` it reports `total_pages: 1`, `current_limit: 0` and the whole list in `items`. `summ` and `items[].price` are **strings with the currency already in them** (`"$25.00"`), `auto_order` and `is_extend` are `"Y"`/`"N"` rather than booleans, and the dates are ISO 8601 with offset (`2026-09-01T14:15:26+00:00`). `id` is the legacy bitrix number as a string; our ObjectId is `order_id`, the same value `ListProxies` returns as `order_id`.
+
 ## proxy/replace takes a reason, not a proxy type
 
 The `type` field of `proxy/replace` is the **replacement reason** (`ProxyReplaceType` on the server), not the proxy type — the proxy type is derived from the first id in `ids`. Allowed values, exported as constants:
@@ -348,6 +366,7 @@ Three things about the answers before you parse them:
 
 - `CalculateProlong` / `MakeProlong` are the struct-based form of the same two calls: `ProlongRequest` carries `IPs` or `IDs`, `PeriodID`/`PeriodCode` and `PaymentID`/`PaymentCode`. `normalizeProlongReferenceCodes` has the same id-or-code fallback as orders, so `PeriodID: "1m"` is enough.
 - `ListProxies` accepts all current filters through `ProxyListOptions`.
+- `ListOrders` accepts all `order/list` filters through `OrderListOptions`; `OrderList` is the no-filter shortcut. See [Listing orders](#listing-orders).
 - `CreateResidentList` and `CreateResidentSubuserList` accept geo, export and rotation options.
 - `CreateResidentSubuser` / `UpdateResidentSubuser` include string traffic limits, expiration, rotation, active and link-date fields.
 - `resident/lists` returns `data` as a **flat array** (no `items` wrapper), matching v1.
@@ -375,6 +394,7 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 
 ### v2.0.1 — catching up with the server
 
+- Added `ListOrders` / `OrderList` (and the package-level `OrderList`) for `GET order/list`, with `OrderListOptions`. Filter names follow v1 (`order_id`, `start_date`, `end_date`, `status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`) because legacy-API clients reach the same endpoint through the reverse mirror. `data` carries `metadata` + `items`, and `summ` / `items[].price` are currency strings, not numbers.
 - Added `CalculateAutoProlong` / `EnableAutoProlong` / `DisableAutoProlong` (and their package-level counterparts) for `autoprolong/{calc,enable,disable}/{type}`, with `AutoProlongRequest`. `PaymentID` is required on calc and enable and restricted to `balance` / `paddle_subscription`; `scraper` is rejected locally.
 - The server **removed** `resident/autorenew/{enable,disable,calculate}` — `type: "resident"` on the three endpoints above replaces them.
 - Added `X-Fingerprint` on `order/make`: `WithFingerprint(...)` / `SetFingerprint(...)`. Residential and scraper orders now fail locally when it is unset instead of being rejected by the server.

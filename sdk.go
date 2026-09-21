@@ -1560,6 +1560,73 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 	return result.Map, err
 }
 
+// OrderList Orders list
+// Шорткат без фильтров, как ProxyList: вся десятка живёт в OrderListOptions (см. ListOrders).
+//
+// id, order_id, order_number, base_order_number и items[].id / items[].order_part_id — СТРОКИ
+// (OrderListItemClientDto и OrderListPositionClientDto объявляют их String). id — легаси-число
+// битрикса либо детерминированный суррогат от base_order_number, тоже строкой; наш ObjectId лежит
+// в order_id, и это тот же order_id, что отдаёт proxy/list.
+//
+// summ и items[].price — ТОЖЕ строки, уже с валютой: "$25.00", формат v1
+// (CCurrencyLang::CurrencyFormat). auto_order и is_extend — "Y"/"N", а не bool. Даты —
+// ISO 8601 со смещением ("2026-09-01T14:15:26+00:00"), date_payed null, пока заказ не оплачен.
+//
+// Ответ, в отличие от proxy/list, всегда завёрнут в metadata + items — форма v1, потому что ту же
+// выдачу через обратное зеркало получают клиенты легаси-API. metadata приходит и без пагинации:
+// тогда total_pages = 1, current_limit = 0, а в items лежит весь список.
+// @return array Example
+// [
+//
+//	'metadata' => [
+//	    'total_orders' => 42, // вся выборка под фильтрами, не размер страницы
+//	    'total_pages' => 3,   // всегда >= 1
+//	    'current_page' => 1,
+//	    'current_limit' => 20, // 0 — выдача без пагинации
+//	],
+//	'items' => [[
+//	    'id' => '1000500',                             // легаси-число битрикса, строкой
+//	    'order_id' => '68b1f0c4e13a4c0f1a2b3c11',      // наш ObjectId, он же order_id в proxy/list
+//	    'order_number' => 'LH-100500_e_9f2c',          // у продления есть хвост _e_<hash>
+//	    'base_order_number' => 'LH-100500',
+//	    'auto_order' => 'N',      // "Y" — у заказа включено автопродление
+//	    'is_extend' => 'Y',       // "Y" — заказ является продлением, а не первичной покупкой
+//	    'date_insert' => '26.06.2023',
+//	    'date_payed' => '26.06.2023', // null, пока заказ не оплачен
+//	    'date_status' => '26.06.2023',
+//	    'payment_name' => 'Balance',
+//	    'url' => '',              // ссылка на оплату; пустая, если платить уже нечего
+//	    'status' => 'Paid',       // человекочитаемый, меняется вместе с переводами
+//	    'status_type' => 'PAYED', // PAYED | NOT_PAYED | RETURN — ветвитесь по нему
+//	    'protocol' => 'HTTP',
+//	    'auth_way' => 'IP',
+//	    'auth_ip' => '1.2.3.4',
+//	    'summ' => '$25.00',       // строка с валютой, не число
+//	    'items' => [[
+//	        'id' => '2000600',                              // легаси-id корзины, строкой
+//	        'order_part_id' => '68b1f0c4e13a4c0f1a2b3c22',  // он же basket_id в proxy/list
+//	        'type' => 'ipv4',
+//	        'ips' => ['1.2.3.4'], // честный пустой массив, пока адреса не выданы
+//	        'quantity' => 10,
+//	        'rotation' => '5 min.',
+//	        'operator' => 'EE',
+//	        'target' => 'SEO',           // имя цели, не id
+//	        'target_section' => 'Marketing',
+//	        'time' => '1 month',
+//	        'price' => '$2.50',          // строка с валютой, не число
+//	        'name' => 'France',
+//	    ]],
+//	]],
+//
+// ]
+func OrderList() (map[string]interface{}, error) {
+	return legacyClient().OrderList()
+}
+
+func (c *Client) OrderList() (map[string]interface{}, error) {
+	return c.ListOrders(OrderListOptions{})
+}
+
 /////////////////////////////// Proxy ///////////////////////////////
 
 // ProxyList Proxies list
@@ -2534,6 +2601,79 @@ func (c *Client) MakeOrder(order OrderRequest) (map[string]interface{}, error) {
 		return nil, err
 	}
 	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.prepareOrder(order, true), headers)
+	return result.Map, err
+}
+
+// OrderListOptions — фильтры order/list. Все опциональные, все уезжают в query.
+//
+// Имена параметров на проводе — snake_case из v1 (OrderController.orderList), а не camelCase
+// proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и переименование
+// заставило бы старую сторону перекладывать параметры. Сервер их не валидирует — неизвестное
+// значение просто не применяется как фильтр, 400 мимо конверта не будет.
+type OrderListOptions struct {
+	// OrderID — ObjectId заказа строкой, не число.
+	OrderID string
+	// StartDate и EndDate — границы по дате создания; принимается и ISO ("2026-09-01"), и "dd.MM.yyyy".
+	StartDate string
+	EndDate   string
+	// Status — PAYED | NOT_PAYED | RETURN. То же значение, что status_type в ответе, а не
+	// человекочитаемый status.
+	Status string
+	// IsExtend — "Y" | "N": только продления либо только первичные покупки.
+	IsExtend string
+	// AutoOrder — "Y" | "N": только заказы с включённым автопродлением либо без него.
+	AutoOrder string
+	// Page и Limit. Без Limit выдача идёт одной страницей, но metadata приходит всё равно —
+	// с total_pages = 1 и current_limit = 0.
+	Page  int
+	Limit int
+	// SortBy — date_insert | summ | status.
+	SortBy string
+	// Order — asc | desc.
+	Order string
+}
+
+func (o OrderListOptions) values() url.Values {
+	values := url.Values{}
+	if o.OrderID != "" {
+		values.Set("order_id", o.OrderID)
+	}
+	if o.StartDate != "" {
+		values.Set("start_date", o.StartDate)
+	}
+	if o.EndDate != "" {
+		values.Set("end_date", o.EndDate)
+	}
+	if o.Status != "" {
+		values.Set("status", o.Status)
+	}
+	if o.IsExtend != "" {
+		values.Set("is_extend", o.IsExtend)
+	}
+	if o.AutoOrder != "" {
+		values.Set("auto_order", o.AutoOrder)
+	}
+	if o.Page > 0 {
+		values.Set("page", fmt.Sprint(o.Page))
+	}
+	if o.Limit > 0 {
+		values.Set("limit", fmt.Sprint(o.Limit))
+	}
+	if o.SortBy != "" {
+		values.Set("sort_by", o.SortBy)
+	}
+	if o.Order != "" {
+		values.Set("order", o.Order)
+	}
+	return values
+}
+
+func (c *Client) ListOrders(options OrderListOptions) (map[string]interface{}, error) {
+	path := "order/list"
+	if query := options.values().Encode(); query != "" {
+		path += "?" + query
+	}
+	result, err := c.Request(http.MethodGet, path, nil)
 	return result.Map, err
 }
 

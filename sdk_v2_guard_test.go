@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -663,5 +664,71 @@ func TestGenerateAuthPrecedence(t *testing.T) {
 	fresh := NewClient("test-key")
 	if got := fresh.prepareOrder(order, true).GenerateAuth; got != "N" {
 		t.Fatalf("умолчание клиента = %q, ожидалось N", got)
+	}
+}
+
+// Имена фильтров order/list — snake_case из v1 (OrderController.orderList), а не camelCase
+// proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и переименование
+// сломало бы их молча — запрос бы ушёл, фильтр бы не применился.
+func TestOrderListSendsV1FilterNames(t *testing.T) {
+	var captured string
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		captured = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"metadata":{},"items":[]},"errors":[]}`))
+	})
+
+	if _, err := client.ListOrders(OrderListOptions{
+		OrderID:   "68b1f0c4e13a4c0f1a2b3c11",
+		StartDate: "01.06.2023",
+		EndDate:   "30.06.2023",
+		Status:    "PAYED",
+		IsExtend:  "Y",
+		AutoOrder: "N",
+		Page:      1,
+		Limit:     20,
+		SortBy:    "date_insert",
+		Order:     "desc",
+	}); err != nil {
+		t.Fatalf("ListOrders: %v", err)
+	}
+
+	query, err := url.ParseQuery(strings.SplitN(captured, "?", 2)[1])
+	if err != nil {
+		t.Fatalf("не разобрался query %q: %v", captured, err)
+	}
+	want := map[string]string{
+		"order_id": "68b1f0c4e13a4c0f1a2b3c11", "start_date": "01.06.2023",
+		"end_date": "30.06.2023", "status": "PAYED", "is_extend": "Y",
+		"auto_order": "N", "page": "1", "limit": "20",
+		"sort_by": "date_insert", "order": "desc",
+	}
+	for key, value := range want {
+		if got := query.Get(key); got != value {
+			t.Fatalf("%s = %q, ожидалось %q (весь запрос: %s)", key, got, value, captured)
+		}
+	}
+	if len(query) != len(want) {
+		t.Fatalf("лишние параметры в %s", captured)
+	}
+}
+
+// Все фильтры опциональны: без них уходит голый order/list, а не "?" с пустыми значениями.
+func TestOrderListWithoutFiltersSendsBarePath(t *testing.T) {
+	var captured string
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		captured = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"metadata":{},"items":[]},"errors":[]}`))
+	})
+
+	if _, err := client.OrderList(); err != nil {
+		t.Fatalf("OrderList: %v", err)
+	}
+	if strings.Contains(captured, "?") {
+		t.Fatalf("без фильтров query быть не должно, получено %s", captured)
+	}
+	if !strings.HasSuffix(captured, "/order/list") {
+		t.Fatalf("путь = %s, ожидался .../order/list", captured)
 	}
 }
