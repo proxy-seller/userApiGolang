@@ -368,9 +368,9 @@ quote, _ := client.ProlongCalc("ipv4", ips, "1m", "")   // price first
 order, err := client.ProlongMake("ipv4", ips, "1m", "") // deducts money
 ```
 
-`ProlongCalc` / `ProlongMake` route every value by its shape and by the type: an address (it contains `.` or `:`) goes to `ips`; anything else goes to `ipIds` for `ipv4`/`isp`/`mobile` and to `orderIds` for `ipv6`/`mix`/`mix_isp`.
+`ProlongCalc` / `ProlongMake` route every value by its shape and by the type: an address (it contains `.` or `:`) goes to `ips`; anything else goes to `ids` for `ipv4`/`isp`/`mobile` and to `orderIds` for `ipv6`/`mix`/`mix_isp`.
 
-**Pass either proxy ids or addresses in one call, not both.** For `ipv4`/`isp`/`mobile` a list that mixes them is refused locally with `mixing proxy ids and addresses in one call is not supported: pass either ids or addresses`, and nothing is sent: given both `ipIds` and `ips`, the server renews by `ipIds` and ignores `ips`, so the addresses would silently drop out of a paid renewal. For `ipv6`/`mix`/`mix_isp` the list is still routed as is — ids to `orderIds`, addresses to `ips` — and the server rejects the `ips` part itself.
+**Pass either proxy ids or addresses in one call, not both.** For `ipv4`/`isp`/`mobile` a list that mixes them is refused locally with `mixing proxy ids and addresses in one call is not supported: pass either ids or addresses`, and nothing is sent: given both `ids` and `ips`, the server renews by `ids` and ignores `ips`, so the addresses would silently drop out of a paid renewal. For `ipv6`/`mix`/`mix_isp` the list is still routed as is — ids to `orderIds`, addresses to `ips` — and the server rejects the `ips` part itself.
 
 **`ipv6`, `mix` and `mix_isp` are renewed as whole orders by `OrderIDs`.** Every active proxy of that type in those orders is renewed — for `mix`/`mix_isp`, the mix packages of those orders — so pass the `order_id`, not addresses or proxy ids:
 
@@ -383,16 +383,16 @@ quote, _ := client.CalculateProlong("ipv6", req)
 made, err := client.MakeProlong("ipv6", req)
 ```
 
-In the struct form the per-proxy types take `req.IPIDs` (proxy `id` values) or `req.IPs` (addresses) — set one of them, since with both the server renews by `IPIDs` and ignores `IPs`:
+In the struct form the per-proxy types take `req.IDs` (proxy `id` values, sent as `ids`) or `req.IPs` (addresses, sent as `ips`) — set one of them, since with both the server renews by `ids` and ignores `ips`:
 
 ```go
-req := api.ProlongRequest{IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PeriodID: "1m"}
+req := api.ProlongRequest{IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PeriodID: "1m"}
 quote, _ := client.CalculateProlong("mobile", req)
 ```
 
 The server refuses the whole request, and renews nothing, when:
 
-- a selection field of the other kind is sent — the error names it: `[ipIds] is not applicable for ipv6: prolong by [orderIds]`, `[ips] is not applicable for mix: prolong by [orderIds]`, `[orderIds] is not applicable for ipv4: prolong by [ipIds]`;
+- a selection field of the other kind is sent — the error (code 0) names it: `[ids] is not applicable for ipv6: prolong by [orderIds]`, `[ips] is not applicable for mix: prolong by [orderIds]`, `[orderIds] is not applicable for ipv4: prolong by [ids]`;
 - an order is not yours or has no active proxy of that type, or `OrderIDs` is empty — code 29, `Incorrect orderIds`.
 
 `ProlongCalc` shows the price; `ProlongMake` charges the balance. Its `data` is `orderId`, `orderIds`, `total`, `listBaseOrderNumbers` and `balance`: `orderIds` lists every renewed order — one request can renew several — and `orderId` is its first element; `listBaseOrderNumbers` holds one base order number per renewed order (per package for `mix`/`mix_isp`), matching `base_order_number` in `ListOrders`. If the balance is short, `ProlongMake` returns an `*APIError` with the server's warning — it never reports a renewal that did not happen.
@@ -403,7 +403,7 @@ The server refuses the whole request, and renews nothing, when:
 
 ```go
 req := api.AutoProlongRequest{}
-req.IPs = []string{"1.2.3.4"}                   // or req.IPIDs; req.OrderIDs for ipv6 / mix / mix_isp
+req.IPs = []string{"1.2.3.4"}                   // or req.IDs; req.OrderIDs for ipv6 / mix / mix_isp
 req.PeriodID = "1m"
 req.PaymentID = "balance"                       // mandatory here
 
@@ -412,11 +412,11 @@ client.EnableAutoProlong("ipv4", req)           // arm it
 client.DisableAutoProlong("ipv4", req)          // disarm it
 ```
 
-The selection follows the same rules as [renewal](#renewing-proxies): `IPIDs` or `IPs` for `ipv4`/`isp`/`mobile`, `OrderIDs` for `ipv6`/`mix`/`mix_isp`, where every active proxy of those orders is switched.
+The selection follows the same rules as [renewal](#renewing-proxies): `IDs` or `IPs` for `ipv4`/`isp`/`mobile`, `OrderIDs` for `ipv6`/`mix`/`mix_isp`, where every active proxy of those orders is switched.
 
 `PaymentID` is **mandatory** for calc and enable — the charge happens while you are away, so the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a one-off Paddle checkout needs a browser redirect a headless client cannot complete. With `paddle_subscription` also set `SubscriptionID`.
 
-Residential packages renew as a package, not as addresses — send no selection, only the payment system and optionally `TarifID` to confirm the tariff already on the package. **Any selection there is an error**: with a non-empty `IPIDs`, `IPs` or `OrderIDs`, `CalculateAutoProlong`, `EnableAutoProlong` and `DisableAutoProlong` for `resident` fail locally with `resident auto-prolong applies to the whole package: do not pass proxy or order ids`, before anything is sent (the server refuses it too). The SDK never drops the selection silently — otherwise a disable meant for a few addresses would switch off the whole package:
+Residential packages renew as a package, not as addresses — send no selection, only the payment system and optionally `TarifID` to confirm the tariff already on the package. **Any selection there is an error**: with a non-empty `IDs`, `IPs` or `OrderIDs`, `CalculateAutoProlong`, `EnableAutoProlong` and `DisableAutoProlong` for `resident` fail locally with `resident auto-prolong applies to the whole package: do not pass proxy or order ids`, before anything is sent (the server refuses any of `ids`, `ips` or `orderIds` there too, with `[ids] is not applicable for resident: auto-prolong applies to the whole package`). The SDK never drops the selection silently — otherwise a disable meant for a few addresses would switch off the whole package:
 
 ```go
 client.EnableAutoProlong("resident", api.AutoProlongRequest{
@@ -427,7 +427,7 @@ client.EnableAutoProlong("resident", api.AutoProlongRequest{
 
 Three things about the answers before you parse them:
 
-* **`ipIds` is not an echo.** `enable` and `disable` answer `ipIds[]` — the ids of the proxies actually affected — and `orderIds[]`, their orders. For `ipv6`, `mix` and `mix_isp` whole orders are switched, so `quantity` and `ipIds` cover every active proxy of the orders you sent. The field used to be called `ids`.
+* **`ids` is not an echo.** `enable` and `disable` answer `ids[]` — the ids of the proxies actually affected — and `orderIds[]`, their orders. For `ipv6`, `mix` and `mix_isp` whole orders are switched, so `quantity` and `ids` cover every active proxy of the orders you sent. For `resident` both are empty.
 * **Not enough money is not an error return.** `calc` answers `status: "error"` with a *filled* `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `warning`.
 * **Residential fills different fields.** `days` and `chargeDate` are null there (a package renews on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd` carry the meaning instead.
 
@@ -437,7 +437,7 @@ Three things about the answers before you parse them:
 
 ## Prolong, proxy and resident options
 
-- `CalculateProlong` / `MakeProlong` are the struct-based form of the same two calls: `ProlongRequest` carries `IPIDs` or `IPs` (`ipv4`/`isp`/`mobile`) or `OrderIDs` (`ipv6`/`mix`/`mix_isp`), `PeriodID`/`PeriodCode` and `PaymentID`/`PaymentCode`. `prolong/*` has the same id-or-code fallback as orders, so `PeriodID: "1m"` is enough.
+- `CalculateProlong` / `MakeProlong` are the struct-based form of the same two calls: `ProlongRequest` carries `IDs` or `IPs` (`ipv4`/`isp`/`mobile`) or `OrderIDs` (`ipv6`/`mix`/`mix_isp`), `PeriodID`/`PeriodCode` and `PaymentID`/`PaymentCode`. `prolong/*` has the same id-or-code fallback as orders, so `PeriodID: "1m"` is enough.
 - `ListProxies` accepts all current filters through `ProxyListOptions`.
 - `ListOrders` accepts all `order/list` filters through `OrderListOptions`; `OrderList` is the no-filter shortcut. See [Listing orders](#listing-orders).
 - `CreateResidentList` and `CreateResidentSubuserList` accept geo, export and rotation options.
@@ -460,7 +460,7 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 | `type` of `proxy/replace` looked like a proxy type | it is the replacement reason enum |
 | `package_key` on `proxy/download/resident` | only on `proxy/download/subresident` |
 | numeric `paymentId` | orders and renewals: the code `balance` or `paddle_subscription`; `balance/add`: an ObjectId string from `balance/payments/list`, which does **not** resolve `paymentCode` |
-| numeric proxy ids for renewal | `ipv4`/`isp`/`mobile`: the address or the proxy `id` from `ListProxies` (`IPs` / `IPIDs`); `ipv6`/`mix`/`mix_isp`: the `order_id` (`OrderIDs`) — they renew as whole orders |
+| numeric proxy ids for renewal | `ipv4`/`isp`/`mobile`: the address or the proxy `id` from `ListProxies` (`IPs` / `IDs`); `ipv6`/`mix`/`mix_isp`: the `order_id` (`OrderIDs`) — they renew as whole orders |
 | `errors[].code` read as a number from an `interface{}` field | typed `APIErrorCode`, use `CodeInt()` |
 
 ## Changelog
@@ -468,12 +468,12 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 ### v2.0.1 — catching up with the server
 
 - **Behaviour change: requests are now paced by default** (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)). All requests share a sliding window of 1000 starts within any 60 s; write and money requests run one at a time through a queue, at least 1 s apart (money requests at least 2 s apart); HTTP 429 from the edge rate limit is retried after `Retry-After`, up to 3 times. Code 57 and the access-denied triple are returned as before and never retried. New options `WithRateLimit`, `WithRequestsPerMinute`, `WithWriteInterval`, `WithMoneyInterval` and `WithMaxRetries`; `WithRateLimit(false)` restores the previous behaviour exactly.
-- **Breaking — renewal selection follows the server.** `ProlongRequest.IDs` (JSON `ids`) is renamed to `IPIDs` (`ipIds`); the server no longer accepts `ids`. `ProlongRequest.OrderSeparatorIDs` / `OrderSeparatorID` (`orderSeparatorIds` / `orderSeparatorId`) are removed — the server dropped both. `AutoProlongRequest` embeds `ProlongRequest`, so the same renames apply to `autoprolong/*`.
-- Added `ProlongRequest.OrderIDs` (`orderIds`). `ipv6`, `mix` and `mix_isp` are renewed only as whole orders, by the `order_id` from `ListProxies` / `ListOrders`, on `prolong/*` and `autoprolong/*`; `ipv4`, `isp` and `mobile` keep renewing per proxy by `IPIDs` or `IPs`. A selection field of the other kind is rejected by the server with an error that names it.
-- `ProlongCalc` / `ProlongMake` route by type: an address goes to `ips`, any other value to `ipIds` (`ipv4`/`isp`/`mobile`) or `orderIds` (`ipv6`/`mix`/`mix_isp`), and `resident` sends no selection. The fallback for values the SDK cannot split no longer sends `ids` either.
-- **Behaviour change:** for `ipv4`/`isp`/`mobile`, `ProlongCalc` / `ProlongMake` now refuse a list that mixes proxy ids and addresses (error, no request) — with both fields the server renews by `ipIds` and ignores `ips`, so the addresses would silently drop out of a paid renewal.
-- **Behaviour change:** `CalculateAutoProlong` / `EnableAutoProlong` / `DisableAutoProlong` with `type = resident` now refuse any non-empty `IPIDs`, `IPs` or `OrderIDs` (error, no request): the package renews as a whole, and a selection is never dropped silently.
-- **Breaking — response fields.** `autoprolong/enable` and `autoprolong/disable` answer `ipIds` instead of `ids`, plus the new `orderIds`. `prolong/make` answers `orderIds` — every renewed order, with `orderId` kept as its first element — and `listBaseOrderNumbers` holds one base order number per renewed order or mix package.
+- **Breaking — renewal selection follows the server.** `ProlongRequest.OrderSeparatorIDs` / `OrderSeparatorID` (`orderSeparatorIds` / `orderSeparatorId`) are removed — the server dropped both; use `OrderIDs`. `IDs` (`ids`) and `IPs` (`ips`) now apply to `ipv4`, `isp` and `mobile` only: for `ipv6`, `mix` and `mix_isp` the server refuses them. `AutoProlongRequest` embeds `ProlongRequest`, so the same applies to `autoprolong/*`.
+- Added `ProlongRequest.OrderIDs` (`orderIds`). `ipv6`, `mix` and `mix_isp` are renewed only as whole orders, by the `order_id` from `ListProxies` / `ListOrders`, on `prolong/*` and `autoprolong/*`; `ipv4`, `isp` and `mobile` keep renewing per proxy by `IDs` (`ids`, the proxy `id`) or `IPs` (`ips`, the addresses) — with both set, the server renews by `ids` and ignores `ips`. A selection field of the other kind is rejected by the server with an error that names it (code 0), e.g. `[ids] is not applicable for ipv6: prolong by [orderIds]`.
+- `ProlongCalc` / `ProlongMake` route by type: an address goes to `ips`, any other value to `ids` (`ipv4`/`isp`/`mobile`) or `orderIds` (`ipv6`/`mix`/`mix_isp`), and `resident` sends no selection. For `ipv6`/`mix`/`mix_isp` the fallback for values the SDK cannot split goes to `orderIds`, not `ids`.
+- **Behaviour change:** for `ipv4`/`isp`/`mobile`, `ProlongCalc` / `ProlongMake` now refuse a list that mixes proxy ids and addresses (error, no request) — with both fields the server renews by `ids` and ignores `ips`, so the addresses would silently drop out of a paid renewal.
+- **Behaviour change:** `CalculateAutoProlong` / `EnableAutoProlong` / `DisableAutoProlong` with `type = resident` now refuse any non-empty `IDs`, `IPs` or `OrderIDs` (error, no request): the package renews as a whole, and a selection is never dropped silently.
+- **Response fields.** `autoprolong/enable` and `autoprolong/disable` answer the new `orderIds` — the orders of the affected proxies — next to `ids`; both are empty for `resident`. `prolong/make` answers `orderIds` — every renewed order, with `orderId` kept as its first element — and `listBaseOrderNumbers` holds one base order number per renewed order or mix package.
 - Added `ListOrders` / `OrderList` (and the package-level `OrderList`) for `GET order/list`, with `OrderListOptions`. Query filters and response fields use snake_case names (`order_id`, `start_date`, `end_date`, `status`, `is_extend`, `auto_order`, `page`, `limit`, `sort_by`, `order`). `data` carries `metadata` + `items`, and `summ` / `items[].price` are currency strings, not numbers.
 - Added `CalculateAutoProlong` / `EnableAutoProlong` / `DisableAutoProlong` (and their package-level counterparts) for `autoprolong/{calc,enable,disable}/{type}`, with `AutoProlongRequest`. `PaymentID` is required on calc and enable and restricted to `balance` / `paddle_subscription`; `scraper` is rejected locally.
 - The server **removed** `resident/autorenew/{enable,disable,calculate}` — `type: "resident"` on the three endpoints above replaces them.

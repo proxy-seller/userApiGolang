@@ -553,7 +553,7 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 
 	// типизированный путь ведёт себя так же
 	client2, _ := newTestClient(t, envelopeHandler(t, insufficient, nil))
-	if _, err = client2.MakeProlong("ipv4", ProlongRequest{IPIDs: []string{"x"}, PeriodID: "1m"}); err == nil {
+	if _, err = client2.MakeProlong("ipv4", ProlongRequest{IDs: []string{"x"}, PeriodID: "1m"}); err == nil {
 		t.Fatal("MakeProlong тоже обязан вернуть ошибку при нехватке средств")
 	}
 
@@ -587,7 +587,7 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 }
 
 // TestSplitProlongTargets — значения разводятся по форме: строка с "." или ":" — адрес, всё
-// остальное — id; смешанный список разводится на обе части. В какое поле уйдут id (ipIds или
+// остальное — id; смешанный список разводится на обе части. В какое поле уйдут id (ids или
 // orderIds) и допустим ли смешанный список, решает тип — см. TestPrepareLegacyProlongRoutesByType.
 func TestSplitProlongTargets(t *testing.T) {
 	cases := []struct {
@@ -622,12 +622,13 @@ func TestSplitProlongTargets(t *testing.T) {
 }
 
 // TestPrepareLegacyProlongRoutesByType — позиционные ProlongCalc/ProlongMake раскладывают выбор
-// по типу. ipv4 / isp / mobile продлеваются по отдельным прокси: id уходит в ipIds, адрес — в ips,
+// по типу. ipv4 / isp / mobile продлеваются по отдельным прокси: id уходит в ids, адрес — в ips,
 // а список, где смешаны id и адреса, отбивается ошибкой (см. TestProlongRefusesMixedIDsAndAddresses).
 // ipv6 / mix / mix_isp продлеваются только целым заказом: id уходит в orderIds, адрес — в ips, и
 // смешанный список уходит как есть (часть ips сервер отбивает сам). resident выбора не шлёт вовсе.
-// Поля ids сервер больше не принимает — его не должно быть ни в одной ветке, включая сырой фолбэк
-// для значения, которое не разобралось.
+// Поля ids у ipv6 / mix / mix_isp нет ни в одной ветке, включая сырой фолбэк для значения, которое
+// не разобралось. Сверяется всё тело, кроме periodId и coupon, поэтому лишнее поле выбора тоже
+// провалит тест.
 func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
 	const (
 		proxyID  = "68b1f0c4e13a4c0f1a2b3c4d"
@@ -638,11 +639,12 @@ func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
 		name      string
 		proxyType string
 		input     interface{}
-		want      map[string]interface{} // только поля выбора: ids / ips / ipIds / orderIds
+		want      map[string]interface{} // всё тело, кроме periodId и coupon, — то есть только выбор
 	}{
 		{"ipv4 address", "ipv4", []string{"1.2.3.4"}, map[string]interface{}{"ips": []string{"1.2.3.4"}}},
-		{"ipv4 id", "ipv4", []string{proxyID}, map[string]interface{}{"ipIds": []string{proxyID}}},
-		{"isp id from a string", "isp", proxyID, map[string]interface{}{"ipIds": []string{proxyID}}},
+		{"ipv4 id", "ipv4", []string{proxyID}, map[string]interface{}{"ids": []string{proxyID}}},
+		{"isp id from a string", "isp", proxyID, map[string]interface{}{"ids": []string{proxyID}}},
+		{"mobile id", "mobile", []string{proxyID}, map[string]interface{}{"ids": []string{proxyID}}},
 		{"mobile address", "mobile", []string{"10.0.0.1:50100:50101"}, map[string]interface{}{"ips": []string{"10.0.0.1:50100:50101"}}},
 		{"ipv6 order id", "ipv6", []string{orderID}, map[string]interface{}{"orderIds": []string{orderID}}},
 		{"mix order ids from a comma string", "mix", orderID + ", " + orderID2,
@@ -657,7 +659,7 @@ func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
 		{"mix mixed list keeps both parts", "mix", []string{"1.2.3.4", orderID},
 			map[string]interface{}{"orderIds": []string{orderID}, "ips": []string{"1.2.3.4"}}},
 		{"resident sends no selection", "resident", []string{proxyID}, map[string]interface{}{}},
-		{"raw fallback goes to ipIds", "ipv4", []int{1, 2}, map[string]interface{}{"ipIds": []int{1, 2}}},
+		{"raw fallback goes to ids", "ipv4", []int{1, 2}, map[string]interface{}{"ids": []int{1, 2}}},
 		{"raw fallback goes to orderIds", "mix", []int{1}, map[string]interface{}{"orderIds": []int{1}}},
 		{"nil sends no selection", "ipv4", nil, map[string]interface{}{}},
 	}
@@ -668,8 +670,8 @@ func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
 				t.Fatalf("неожиданная ошибка: %v", err)
 			}
 			got := map[string]interface{}{}
-			for _, field := range []string{"ids", "ips", "ipIds", "orderIds"} {
-				if value, present := data[field]; present {
+			for field, value := range data {
+				if field != "periodId" && field != "coupon" {
 					got[field] = value
 				}
 			}
@@ -684,7 +686,7 @@ func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
 }
 
 // ipv4 / isp / mobile: список, где смешаны id прокси и адреса, отбивается до запроса — получив оба
-// поля, сервер продлевает по ipIds и молча игнорирует ips, и адреса выпали бы из оплаченного
+// поля, сервер продлевает по ids и молча игнорирует ips, и адреса выпали бы из оплаченного
 // продления. Ни calc, ни make с таким списком на сервер не уходят.
 func TestProlongRefusesMixedIDsAndAddresses(t *testing.T) {
 	var requests int32
@@ -700,7 +702,8 @@ func TestProlongRefusesMixedIDsAndAddresses(t *testing.T) {
 	}
 	for proxyType, list := range mixed {
 		if _, err := client.ProlongCalc(proxyType, list, "1m", ""); err == nil ||
-			!strings.Contains(err.Error(), "mixing proxy ids and addresses") {
+			!strings.Contains(err.Error(), "mixing proxy ids and addresses") ||
+			!strings.Contains(err.Error(), "the server renews by ids and silently ignores ips") {
 			t.Fatalf("ProlongCalc(%s, смешанный список): ожидалась локальная ошибка, получено %v", proxyType, err)
 		}
 		if _, err := client.ProlongMake(proxyType, strings.Join(list, ","), "1m", ""); err == nil ||
@@ -724,7 +727,7 @@ func TestProlongRefusesMixedIDsAndAddresses(t *testing.T) {
 	}
 }
 
-// Резидентский пакет продлевается целиком: любой непустой выбор (IPIDs, IPs, OrderIDs) при
+// Резидентский пакет продлевается целиком: любой непустой выбор (IDs, IPs, OrderIDs) при
 // type = resident отбивается до запроса — для calc, enable и disable. Его нельзя ни отправить, ни
 // молча выбросить: тогда disable, адресованный паре прокси, выключил бы автопродление всего пакета.
 func TestAutoProlongResidentRefusesSelection(t *testing.T) {
@@ -732,10 +735,10 @@ func TestAutoProlongResidentRefusesSelection(t *testing.T) {
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&requests, 1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"success","data":{"autoProlong":false,"quantity":1,"ipIds":[],"orderIds":[]},"errors":[]}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"autoProlong":false,"quantity":1,"ids":[],"orderIds":[]},"errors":[]}`))
 	})
 	selections := map[string]ProlongRequest{
-		"IPIDs":    {IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PaymentID: "balance"},
+		"IDs":      {IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PaymentID: "balance"},
 		"IPs":      {IPs: []string{"1.2.3.4"}, PaymentID: "balance"},
 		"OrderIDs": {OrderIDs: []string{"6a248de4717805635cf6057d"}, PaymentID: "balance"},
 	}
@@ -765,15 +768,15 @@ func TestAutoProlongResidentRefusesSelection(t *testing.T) {
 	if _, err := client.DisableAutoProlong("resident", AutoProlongRequest{}); err != nil {
 		t.Fatalf("DisableAutoProlong(resident) без выбора: %v", err)
 	}
-	if _, err := client.DisableAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}}}); err != nil {
-		t.Fatalf("DisableAutoProlong(ipv4) с IPIDs: %v", err)
+	if _, err := client.DisableAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}}}); err != nil {
+		t.Fatalf("DisableAutoProlong(ipv4) с IDs: %v", err)
 	}
 	if got := atomic.LoadInt32(&requests); got != 3 {
 		t.Fatalf("ожидалось 3 запроса, ушло %d", got)
 	}
 }
 
-// Тот же выбор на проводе: тело prolong/calc/ipv6 несёт orderIds, а не ids и не ipIds.
+// Тот же выбор на проводе: тело prolong/calc/ipv6 несёт orderIds, а не ids.
 func TestProlongCalcSendsOrderIDsForOrderTypes(t *testing.T) {
 	var body string
 	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"total":1},"errors":[]}`, &body))
@@ -785,17 +788,35 @@ func TestProlongCalcSendsOrderIDsForOrderTypes(t *testing.T) {
 	}
 }
 
-// Поля ProlongRequest уходят под именами контракта: ipIds, ips, orderIds. Прежних ids,
+// И обратная сторона: у ipv4 / isp / mobile id прокси уходит в ids, адрес — в ips.
+func TestProlongCalcSendsIDsForPerProxyTypes(t *testing.T) {
+	var body string
+	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"total":1},"errors":[]}`, &body))
+	cases := []struct{ proxyType, value, want string }{
+		{"ipv4", "68b1f0c4e13a4c0f1a2b3c4d", `{"coupon":"","ids":["68b1f0c4e13a4c0f1a2b3c4d"],"periodId":"1m"}`},
+		{"mobile", "10.0.0.1:50100:50101", `{"coupon":"","ips":["10.0.0.1:50100:50101"],"periodId":"1m"}`},
+	}
+	for _, tc := range cases {
+		if _, err := client.ProlongCalc(tc.proxyType, []string{tc.value}, "1m", ""); err != nil {
+			t.Fatalf("ProlongCalc(%s): %v", tc.proxyType, err)
+		}
+		if body != tc.want {
+			t.Fatalf("ProlongCalc(%s): тело = %s, ожидалось %s", tc.proxyType, body, tc.want)
+		}
+	}
+}
+
+// Поля ProlongRequest уходят под именами контракта: ids, ips, orderIds. Удалённых из контракта
 // orderSeparatorIds и orderSeparatorId в теле нет; AutoProlongRequest встраивает те же поля.
 func TestProlongRequestWireNames(t *testing.T) {
 	encoded, err := json.Marshal(ProlongRequest{
-		IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, IPs: []string{"1.2.3.4"},
+		IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, IPs: []string{"1.2.3.4"},
 		OrderIDs: []string{"6a248de4717805635cf6057d"}, PeriodID: "1m",
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if want := `{"ipIds":["68b1f0c4e13a4c0f1a2b3c4d"],"ips":["1.2.3.4"],"orderIds":["6a248de4717805635cf6057d"],"periodId":"1m"}`; string(encoded) != want {
+	if want := `{"ids":["68b1f0c4e13a4c0f1a2b3c4d"],"ips":["1.2.3.4"],"orderIds":["6a248de4717805635cf6057d"],"periodId":"1m"}`; string(encoded) != want {
 		t.Fatalf("ProlongRequest = %s, ожидалось %s", encoded, want)
 	}
 

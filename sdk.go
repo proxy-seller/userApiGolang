@@ -146,7 +146,7 @@ func (c APIErrorCode) MarshalJSON() ([]byte, error) {
 func (c APIErrorCode) String() string { return string(c) }
 
 // Int — код числом. 0, если код пустой или нечисловой (0 — тоже валидный код: с ним приходят,
-// например, "Set [paymentId]" и "[ipIds] is not applicable for ipv6: prolong by [orderIds]").
+// например, "Set [paymentId]" и "[ids] is not applicable for ipv6: prolong by [orderIds]").
 func (c APIErrorCode) Int() int {
 	value, err := c.Int64()
 	if err != nil {
@@ -2310,7 +2310,7 @@ func normalizeProlongType(proxyType string) string {
 
 // prolongIDField — поле тела prolong/*, в которое уходят id для этого типа:
 //
-//	ipv4, isp, mobile  → "ipIds":    продление по отдельным прокси, это поле id из proxy/list;
+//	ipv4, isp, mobile  → "ids":      продление по отдельным прокси, это поле id из proxy/list;
 //	ipv6, mix, mix_isp → "orderIds": продаются и продлеваются только целым заказом, это поле
 //	                                 order_id из proxy/list или order/list;
 //	resident           → "":         выбора в теле нет вовсе (prolong/* для резидентки
@@ -2324,7 +2324,7 @@ func prolongIDField(proxyType string) string {
 	case "resident":
 		return ""
 	}
-	return "ipIds"
+	return "ids"
 }
 
 // splitProlongTargets разводит то, что пришло от вызывающего, на адреса и id.
@@ -2332,7 +2332,7 @@ func prolongIDField(proxyType string) string {
 // Адрес — строка с "." или ":" в том виде, в каком его отдаёт proxy/list: ipv4/isp — "ip",
 // mobile — "ip:port_http:port_socks" (оба порта есть в proxy/list). У ObjectId (24 hex-символа)
 // нет ни точек, ни двоеточий, поэтому одно от другого отличается надёжно. В какое поле уйдут
-// id — ipIds или orderIds, — и допустим ли смешанный список, решает тип (prepareLegacyProlong).
+// id — ids или orderIds, — и допустим ли смешанный список, решает тип (prepareLegacyProlong).
 func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
 	var items []string
 	switch value := ipsOrIds.(type) {
@@ -2367,20 +2367,22 @@ func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
 
 // prepareLegacyProlong — тело позиционных ProlongCalc/ProlongMake.
 //
-// Адреса уходят в ips, остальные значения — в поле id этого типа: ipIds у ipv4/isp/mobile,
+// Адреса уходят в ips, остальные значения — в поле id этого типа: ids у ipv4/isp/mobile,
 // orderIds у ipv6/mix/mix_isp.
 //
 // ipv4/isp/mobile: список, в котором смешаны id прокси и адреса, отбивается ошибкой до запроса.
-// Получив оба поля, сервер продлевает по ipIds и молча игнорирует ips — адреса выпали бы из
+// Получив оба поля, сервер продлевает по ids и молча игнорирует ips — адреса выпали бы из
 // оплаченного продления, и вызывающий об этом не узнал бы.
 //
 // ipv6/mix/mix_isp: адрес уходит в ips, в том числе вперемешку с id заказов. Сервер отбивает такой
 // запрос целиком с понятной причиной ("[ips] is not applicable for ipv6: prolong by [orderIds]"),
-// а SDK не пытается угадать заказ по адресу.
+// а SDK не пытается угадать заказ по адресу. Поле ids у этих типов не шлётся ни в какой ветке,
+// включая сырой фолбэк: сервер отбил бы и его ("[ids] is not applicable for ipv6: prolong by
+// [orderIds]").
 //
 // resident: выбора в теле нет вовсе. prolong/* для резидентки сервер отбивает целиком
 // ("Create new order to add traffic, prolong options not available"), так что незаметно ничего
-// не продлится. Поля ids сервер больше не принимает, и SDK его не шлёт ни в какой ветке.
+// не продлится.
 func (c *Client) prepareLegacyProlong(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	data := map[string]interface{}{
 		"periodId": periodId,
@@ -2388,8 +2390,8 @@ func (c *Client) prepareLegacyProlong(proxyType string, ipsOrIds interface{}, pe
 	}
 	if idField := prolongIDField(proxyType); idField != "" {
 		ips, ids := splitProlongTargets(ipsOrIds)
-		if idField == "ipIds" && len(ips) > 0 && len(ids) > 0 {
-			return nil, fmt.Errorf("prolong/%s: mixing proxy ids and addresses in one call is not supported: pass either ids or addresses (with both, the server renews by ipIds and silently ignores ips)", normalizeProlongType(proxyType))
+		if idField == "ids" && len(ips) > 0 && len(ids) > 0 {
+			return nil, fmt.Errorf("prolong/%s: mixing proxy ids and addresses in one call is not supported: pass either ids or addresses (with both, the server renews by ids and silently ignores ips)", normalizeProlongType(proxyType))
 		}
 		if len(ips) > 0 {
 			data["ips"] = ips
@@ -2412,10 +2414,10 @@ func (c *Client) prepareLegacyProlong(proxyType string, ipsOrIds interface{}, pe
 }
 
 // normalizeIDs приводит "a,b,c" к []string. Ветка []int убрана осознанно: во всех полях-списках
-// id (ids у proxy/replace и proxy/comment/set, ipIds и orderIds у prolong/* и autoprolong/*)
-// сервер ждёт строки ObjectId. Числовые id остались только в v1, и превращение []int в ["1","2"]
-// лишь маскировало ошибку вызывающего: сервер всё равно не нашёл бы такие прокси. Значения
-// не-string теперь уходят как есть.
+// id (ids у proxy/replace, proxy/comment/set, prolong/* и autoprolong/*, orderIds у prolong/* и
+// autoprolong/*) сервер ждёт строки ObjectId. Числовые id остались только в v1, и превращение
+// []int в ["1","2"] лишь маскировало ошибку вызывающего: сервер всё равно не нашёл бы такие
+// прокси. Значения не-string теперь уходят как есть.
 func normalizeIDs(ids interface{}) interface{} {
 	switch value := ids.(type) {
 	case string:
@@ -2430,8 +2432,8 @@ func normalizeIDs(ids interface{}) interface{} {
 // @param ipsOrIds - a slice or a comma-separated string; what identifies a proxy depends on the type.
 // ipv4, isp and mobile are renewed per proxy: pass the address exactly as proxy/list returns it
 // ("1.2.3.4" for ipv4/isp, ip + ":" + port_http + ":" + port_socks for mobile) or the proxy "id"
-// from proxy/list. Addresses go to ips, ids to ipIds. Pass either ids or addresses, not both: a
-// slice that mixes them is refused locally, because with both fields the server renews by ipIds
+// from proxy/list. Addresses go to ips, proxy ids to ids. Pass either ids or addresses, not both:
+// a slice that mixes them is refused locally, because with both fields the server renews by ids
 // and silently ignores ips.
 // ipv6, mix and mix_isp are renewed only as whole orders: pass the "order_id" from proxy/list or
 // order/list; it goes to orderIds, and every active proxy of that type in those orders is renewed
@@ -2838,15 +2840,15 @@ func (c *Client) SetProxyComment(ids []string, comment string) (map[string]inter
 //
 // Which field selects the proxies depends on the type in the path:
 //
-//	ipv4, isp, mobile   renewed per proxy: IPIDs (the "id" field of proxy/list) or IPs (the
-//	                    addresses). If both are set, the server uses IPIDs.
+//	ipv4, isp, mobile   renewed per proxy: IDs (the "id" field of proxy/list) or IPs (the
+//	                    addresses). If both are set, the server renews by IDs and ignores IPs.
 //	ipv6, mix, mix_isp  renewed only as whole orders: OrderIDs (the "order_id" field of proxy/list
 //	                    or order/list). Every active proxy of that type in those orders is renewed;
 //	                    for mix/mix_isp — the mix packages of those orders.
 //
-// A field of the other kind is rejected with an error that names it, e.g.
-// "[ipIds] is not applicable for ipv6: prolong by [orderIds]" or
-// "[orderIds] is not applicable for ipv4: prolong by [ipIds]". An order that is not yours or has no
+// A field of the other kind is rejected with an error that names it (code 0), e.g.
+// "[ids] is not applicable for ipv6: prolong by [orderIds]" or
+// "[orderIds] is not applicable for ipv4: prolong by [ids]". An order that is not yours or has no
 // active proxy of that type — or an empty OrderIDs — fails the whole request with code 29,
 // "Incorrect orderIds", and nothing is renewed.
 //
@@ -2854,10 +2856,10 @@ func (c *Client) SetProxyComment(ids []string, comment string) (map[string]inter
 // not a known id is resolved as a code, so PeriodID: "1m" is enough. They are the only two reference
 // fields prolong accepts.
 type ProlongRequest struct {
-	// IPIDs — ipv4 / isp / mobile only: proxy ids, the "id" field of proxy/list.
-	IPIDs []string `json:"ipIds,omitempty"`
+	// IDs — ipv4 / isp / mobile only: proxy ids, the "id" field of proxy/list.
+	IDs []string `json:"ids,omitempty"`
 	// IPs — ipv4 / isp / mobile only: the addresses themselves, as proxy/list returns them —
-	// ipv4/isp "ip", mobile "ip:port_http:port_socks". Ignored by the server when IPIDs is set.
+	// ipv4/isp "ip", mobile "ip:port_http:port_socks". Ignored by the server when IDs is set.
 	IPs []string `json:"ips,omitempty"`
 	// OrderIDs — ipv6 / mix / mix_isp only: order ids, the "order_id" field of proxy/list or
 	// order/list.
@@ -2910,16 +2912,16 @@ const (
 // AutoProlongRequest — тело autoprolong/calc|enable|disable/{type}.
 //
 // Встраивает ProlongRequest: автопродление выбирает прокси теми же полями и по тем же правилам,
-// что и ручное продление, — ipv4 / isp / mobile по IPIDs либо IPs, ipv6 / mix / mix_isp целыми
+// что и ручное продление, — ipv4 / isp / mobile по IDs либо IPs, ipv6 / mix / mix_isp целыми
 // заказами по OrderIDs (затрагивается каждый активный прокси этого типа в этих заказах), — и так
 // же принимает PeriodID/PeriodCode и PaymentID/PaymentCode (id либо код). Сверху добавлены только
 // SubscriptionID и TarifID.
 //
-// Для type = resident выбора нет вовсе: единица — пакет самого аккаунта. Непустые IPIDs / IPs /
+// Для type = resident выбора нет вовсе: единица — пакет самого аккаунта. Непустые IDs / IPs /
 // OrderIDs там SDK отбивает ещё до запроса (см. assertAutoProlong) — их нельзя ни отправить
-// (сервер ответит "[ipIds] is not applicable for resident: auto-prolong applies to the whole
-// package"), ни молча выбросить: тогда disable, адресованный паре прокси, выключил бы
-// автопродление всего пакета.
+// (на любое из трёх полей сервер ответит "[ids] is not applicable for resident: auto-prolong
+// applies to the whole package"), ни молча выбросить: тогда disable, адресованный паре прокси,
+// выключил бы автопродление всего пакета.
 //
 // Сервер принимает и snake-алиасы (payment_id, subscription_id, tarif_id, tariffId) с
 // приоритетом camelCase > snake_case; SDK всегда шлёт каноническое camelCase-написание.
@@ -2944,7 +2946,7 @@ type AutoProlongRequest struct {
 // заранее: тип, который ручка не обслуживает, выбор прокси у резидентки и платёжку, без которой
 // списание невозможно.
 //
-// Резидентский пакет продлевается целиком, поэтому любой непустой выбор (IPIDs, IPs, OrderIDs)
+// Резидентский пакет продлевается целиком, поэтому любой непустой выбор (IDs, IPs, OrderIDs)
 // при type = resident — ошибка для всех трёх вызовов, включая disable.
 //
 // paymentRequired — только для calc и enable: списание произойдёт без клиента, поэтому
@@ -2963,8 +2965,8 @@ func assertAutoProlong(proxyType string, request AutoProlongRequest, paymentRequ
 		return fmt.Errorf("autoprolong: scraper is extended by buying traffic through order/make, the server replies %q", "Create new order to add traffic, prolong options not available")
 	}
 	if normalizeProlongType(proxyType) == "resident" &&
-		(len(request.IPIDs) > 0 || len(request.IPs) > 0 || len(request.OrderIDs) > 0) {
-		return fmt.Errorf("autoprolong: resident auto-prolong applies to the whole package: do not pass proxy or order ids (IPIDs, IPs and OrderIDs must be empty)")
+		(len(request.IDs) > 0 || len(request.IPs) > 0 || len(request.OrderIDs) > 0) {
+		return fmt.Errorf("autoprolong: resident auto-prolong applies to the whole package: do not pass proxy or order ids (IDs, IPs and OrderIDs must be empty)")
 	}
 	if !paymentRequired {
 		return nil
@@ -3010,9 +3012,9 @@ func AutoProlongCalc(proxyType string, request AutoProlongRequest) (map[string]i
 // заполненным warning и nil-ошибкой.
 //
 // У обычных прокси период обязателен (PeriodID либо PeriodCode), иначе
-// "Set existed [periodId] from reference", а выбор — как у prolong/calc: IPIDs либо IPs для
+// "Set existed [periodId] from reference", а выбор — как у prolong/calc: IDs либо IPs для
 // ipv4/isp/mobile, OrderIDs для ipv6/mix/mix_isp. Для type = resident тело пакетное: PaymentID и
-// опционально TarifID, без PeriodID и без выбора (непустые IPIDs/IPs/OrderIDs SDK отбивает до
+// опционально TarifID, без PeriodID и без выбора (непустые IDs/IPs/OrderIDs SDK отбивает до
 // запроса), а в ответе quantity = 1 и пустой items.
 func (c *Client) CalculateAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
@@ -3031,16 +3033,16 @@ func AutoProlongEnable(proxyType string, request AutoProlongRequest) (map[string
 
 // EnableAutoProlong включает автопродление и привязывает к прокси период и платёжку.
 //
-// Поля ответа: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate,
-// dateEnd. Прежнее поле ids сервер переименовал в ipIds.
+// Поля ответа: warning, autoProlong, quantity, ids[], orderIds[], days, paymentId, chargeDate,
+// dateEnd.
 //
-// quantity, ipIds и orderIds — это то, что РЕАЛЬНО затронуто, а не эхо запроса: ipIds — id
+// quantity, ids и orderIds — это то, что РЕАЛЬНО затронуто, а не эхо запроса: ids — id
 // затронутых прокси (поле id из proxy/list), orderIds — их заказы без повторов. ipv6 / mix /
-// mix_isp включаются целыми заказами (OrderIDs), поэтому quantity и ipIds покрывают все активные
+// mix_isp включаются целыми заказами (OrderIDs), поэтому quantity и ids покрывают все активные
 // прокси присланных заказов.
 //
 // Для type = resident единица правки — пакет: достаточно PaymentID (выбор прокси SDK отбивает),
-// в ответе quantity = 1 и пустые ipIds и orderIds. Этот вызов заменил удалённый
+// в ответе quantity = 1 и пустые ids и orderIds. Этот вызов заменил удалённый
 // resident/autorenew/enable.
 func (c *Client) EnableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
@@ -3059,14 +3061,15 @@ func AutoProlongDisable(proxyType string, request AutoProlongRequest) (map[strin
 
 // DisableAutoProlong выключает автопродление и сбрасывает привязанные период и платёжку, так
 // что следующий enable обязан прислать их заново. Ни период, ни платёжка здесь не нужны —
-// только выбор прокси, как у enable (IPIDs либо IPs для ipv4/isp/mobile, OrderIDs для
+// только выбор прокси, как у enable (IDs либо IPs для ipv4/isp/mobile, OrderIDs для
 // ipv6/mix/mix_isp). Для type = resident выбора быть не должно — адресуется пакет самого
-// аккаунта, и непустые IPIDs/IPs/OrderIDs SDK отбивает до запроса, чтобы disable, адресованный
+// аккаунта, и непустые IDs/IPs/OrderIDs SDK отбивает до запроса, чтобы disable, адресованный
 // паре прокси, не выключил автопродление всего пакета. Этот вызов заменил удалённый
 // resident/autorenew/disable.
 //
-// В ответе те же ipIds[] и orderIds[], что у enable; days, paymentId и chargeDate — null, а
-// dateEnd остаётся: прокси никуда не делись, они просто перестали продлеваться сами.
+// В ответе те же ids[] и orderIds[], что у enable (у resident оба пустые); days, paymentId и
+// chargeDate — null, а dateEnd остаётся: прокси никуда не делись, они просто перестали
+// продлеваться сами.
 func (c *Client) DisableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
 	if err := assertAutoProlong(proxyType, prepared, false); err != nil {
