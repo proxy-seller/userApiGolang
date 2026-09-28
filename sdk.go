@@ -2723,8 +2723,14 @@ func (c *Client) ListOrders(options OrderListOptions) (map[string]interface{}, e
 }
 
 type ProxyListOptions struct {
+	// Latest = "Y" — только прокси последнего заказа среди тех, что вернул бы запрос: с типом —
+	// последнего заказа этого типа (mix / mix_isp — последнего MIX), без типа — один последний
+	// заказ на весь ответ. «Последний» — по покупке, продление не в счёт. С OrderID игнорируется,
+	// на resident и scraper не действует.
 	Latest string
-	// OrderID — ObjectId string заказа, не число.
+	// OrderID — любой идентификатор заказа из ответов API: order_id (ListProxies / ListOrders),
+	// числовой id строки ListOrders (id строки продления — её заказ) или номер: текущий
+	// order_number, base_order_number либо прежний номер продлённого заказа (_e_<hash>).
 	OrderID string
 	Country string
 	Ends    string
