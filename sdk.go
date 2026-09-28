@@ -15,13 +15,16 @@ import (
 
 const DefaultBaseURL = "https://proxy-seller.com/personal/api/v2/"
 
-// FingerprintHeader — имя заголовка отпечатка установки, объявленного в контракте
+// FingerprintHeader — имя необязательного заголовка отпечатка установки, объявленного в контракте
 // (components.parameters.Fingerprint). См. WithFingerprint.
 const FingerprintHeader = "X-Fingerprint"
 
 // URL is kept for source compatibility. New code should use WithBaseURL.
 var URL = DefaultBaseURL
 
+// Client is safe for concurrent use. Its requests are paced by default — see WithRateLimit and the
+// README section "Rate limits and the request queue" — and the pacing state lives in the instance,
+// so share one Client per API key.
 type Client struct {
 	mu           sync.RWMutex
 	baseURL      string
@@ -31,6 +34,7 @@ type Client struct {
 	generateAuth string
 	fingerprint  string
 	httpClient   *http.Client
+	limiter      *rateLimiter // pacing of every request, see ratelimit.go
 }
 
 type ClientOption func(*Client)
@@ -41,14 +45,13 @@ func WithBaseURL(baseURL string) ClientOption {
 
 // WithFingerprint задаёт значение заголовка X-Fingerprint для order/make.
 //
-// Контракт объявляет заголовок обязательным на всей операции order/make, но реально его
-// требуют только резидентские и скраперные заказы: OrderService отвечает
-// "Header X-Fingerprint is required" и не создаёт заказ вовсе. Прочие секции заголовок
-// игнорируют, поэтому SDK шлёт его всегда, когда значение задано.
+// Заголовок необязателен: без него сервер заказ не отбивает ни в одной секции, а когда он
+// есть — использует для анти-фрода и affiliate-атрибуции. SDK шлёт его на order/make всегда,
+// когда значение задано, и никогда не требует.
 //
-// Значение по форме не проверяется ("any opaque string is accepted") — важна только его
-// стабильность в пределах установки клиента. SDK НЕ генерирует его сам: случайное значение
-// на процесс ломает анти-фрод и affiliate-атрибуцию, ради которых заголовок и введён.
+// Значение по форме не проверяется ("any string is accepted") — важна только его стабильность
+// в пределах установки клиента. SDK НЕ генерирует его сам: случайное значение на процесс ломает
+// анти-фрод и affiliate-атрибуцию, ради которых заголовок и введён.
 func WithFingerprint(fingerprint string) ClientOption {
 	return func(c *Client) { c.fingerprint = strings.TrimSpace(fingerprint) }
 }
@@ -75,7 +78,7 @@ func WithTimeout(timeout time.Duration) ClientOption {
 }
 
 func NewClient(apiKey string, options ...ClientOption) *Client {
-	c := &Client{baseURL: DefaultBaseURL, apiKey: apiKey, generateAuth: "N", httpClient: &http.Client{Timeout: 30 * time.Second}}
+	c := &Client{baseURL: DefaultBaseURL, apiKey: apiKey, generateAuth: "N", httpClient: &http.Client{Timeout: 30 * time.Second}, limiter: newRateLimiter()}
 	for _, option := range options {
 		option(c)
 	}
@@ -103,9 +106,8 @@ func NewResultData() ResultData {
 
 // APIErrorCode — значение errors[].code конверта client-api v2.
 //
-// На бэкенде код ВСЕГДА целый: ProxySellerApiErrorItemDto.code и ClientApiErrorsDto.code
-// объявлены как `int`, у резидентских маршрутов — ApiErrorDto.code, тоже `int`.
-// Раньше это поле лежало в interface{}, и encoding/json раскладывал число в float64:
+// На проводе код ВСЕГДА целое JSON-число — на всех маршрутах, включая resident/* и
+// residentsubuser/*. Раньше это поле лежало в interface{}, и encoding/json раскладывал число в float64:
 // сравнение `item.Code == 503` было тихо ложным всегда, потому что сравнивался int-литерал
 // с float64. Тип хранит исходный литерал (как json.Number) и умеет отдать его числом;
 // строковый код тоже принимается — чтобы неожиданный формат не ронял разбор всего ответа.
@@ -143,8 +145,8 @@ func (c APIErrorCode) MarshalJSON() ([]byte, error) {
 
 func (c APIErrorCode) String() string { return string(c) }
 
-// Int — код числом. 0, если код пустой или нечисловой (0 у сервера тоже валиден:
-// ClientApiErrors.IP_NOT_FOUND и ошибки, собранные вручную, используют code 0).
+// Int — код числом. 0, если код пустой или нечисловой (0 — тоже валидный код: с ним приходят,
+// например, "Set [paymentId]" и "[ipIds] is not applicable for ipv6: prolong by [orderIds]").
 func (c APIErrorCode) Int() int {
 	value, err := c.Int64()
 	if err != nil {
@@ -159,8 +161,8 @@ func (c APIErrorCode) Int64() (int64, error) {
 	if err == nil {
 		return value, nil
 	}
-	// Подстраховка на случай кода, пришедшего дробным литералом (503.0): сам сервер
-	// объявляет код int, но ронять разбор из-за формата числа не хочется.
+	// Подстраховка на случай кода, пришедшего дробным литералом (503.0): сервер шлёт код
+	// целым числом, но ронять разбор из-за формата числа не хочется.
 	if asFloat, floatErr := strconv.ParseFloat(text, 64); floatErr == nil {
 		return int64(asFloat), nil
 	}
@@ -240,14 +242,15 @@ func (e *APIError) FirstCustomData() interface{} {
 
 // IsAccessError — ошибка доступа: битый ключ, IP не в белом списке либо превышенный
 // rate limit. Сервер во всех трёх случаях отвечает HTTP 200 и ОДНОЙ И ТОЙ ЖЕ тройкой
-// ошибок (LegacyClientApiErrorHelper.legacyAccessErrors): "Error api key" /
-// "IP not allowed <ip>" / "Request limit reached", у всех code 503. Отличить причину по
-// ответу нельзя — HTTP 429 в v2 не существует. Условие повторяет серверный
-// LegacyClientApiErrorHelper.isAccessError.
+// ошибок: "Error api key" / "IP not allowed <ip>" / "Request limit reached", у всех code 503.
+// Отличить причину по ответу нельзя: сам API HTTP 429 не отдаёт (429 бывает только от edge-лимита
+// перед API, и такой ответ клиент повторяет сам — см. WithMaxRetries). Эту тройку SDK не повторяет
+// никогда: она неотличима от неверного ключа или IP. Ошибкой доступа считается
+// любой элемент errors[] с кодом 2 или 3 либо с одним из этих сообщений (или "Error auth.*").
 func (e *APIError) IsAccessError() bool {
 	for _, item := range e.Errors {
 		switch item.CodeInt() {
-		case 2, 3: // ERROR_API_KEY, ERROR_AUTH_IP
+		case 2, 3: // ошибка API-ключа; IP не разрешён
 			return true
 		}
 		if item.Message == "Error api key" || item.Message == "Request limit reached" ||
@@ -279,19 +282,27 @@ func (c *Client) SetBaseURL(baseURL string) {
 	c.mu.Unlock()
 }
 
-// SetPaymentId payment system id (MongoDB ObjectId from balance/payments/list)
+// SetPaymentId sets the payment system sent with orders and renewals, and the default paymentId of
+// balance/add. Orders and renewals accept only the balance and the saved card — for them prefer
+// SetPaymentCode("balance") / SetPaymentCode("paddle_subscription"); balance/add takes an ObjectId
+// from balance/payments/list, which never lists the balance itself.
 func SetPaymentId(id string) {
 	DefaultClient.SetPaymentID(id)
 }
 
+// SetPaymentCode sets the payment code sent with orders and renewals: "balance" (pay from the
+// balance) or "paddle_subscription" (the saved card; needs an active card subscription) — the only
+// two systems order/make accepts. balance/add does not resolve codes — see AddBalance.
 func SetPaymentCode(code string) { DefaultClient.SetPaymentCode(code) }
 
+// SetPaymentID — see the package-level SetPaymentId.
 func (c *Client) SetPaymentID(id string) {
 	c.mu.Lock()
 	c.paymentID, c.paymentCode = id, ""
 	c.mu.Unlock()
 }
 
+// SetPaymentCode — see the package-level SetPaymentCode: "balance" or "paddle_subscription".
 func (c *Client) SetPaymentCode(code string) {
 	c.mu.Lock()
 	c.paymentCode, c.paymentID = code, ""
@@ -396,6 +407,8 @@ func (c *Client) snapshot() (string, string, *http.Client, error) {
 	return normalizeBaseURL(c.baseURL), c.apiKey, httpClient, nil
 }
 
+// Request sends any API call by its path relative to the API root ("order/list", "prolong/make/ipv4").
+// It is paced like every other call; the category (read, write or money) follows from the path.
 func (c *Client) Request(method, uri string, data interface{}) (ResultData, error) {
 	return c.RequestWithHeaders(method, uri, data, nil)
 }
@@ -415,6 +428,9 @@ func (c *Client) do(method, uri string, data interface{}) ([]byte, int, error) {
 	return c.doWithHeaders(method, uri, data, nil)
 }
 
+// doWithHeaders — единственное место, откуда SDK отправляет HTTP-запросы, а значит и единственное
+// место, где задаётся их темп: каждый запрос проходит через rateLimiter клиента (общее окно, очередь
+// записи, повтор HTTP 429 — см. ratelimit.go), а категорию запроса определяет classifyRequest по пути.
 func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map[string]string) ([]byte, int, error) {
 	baseURL, key, httpClient, err := c.snapshot()
 	if err != nil {
@@ -435,37 +451,47 @@ func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map
 	}
 	parsed.RawPath = escapedPath
 	parsed.RawQuery = relative.RawQuery
-	var reader io.Reader
+	var payload []byte
 	if method != http.MethodGet && method != http.MethodHead && data != nil {
-		payload, marshalErr := json.Marshal(data)
-		if marshalErr != nil {
-			return nil, 0, marshalErr
+		payload, err = json.Marshal(data)
+		if err != nil {
+			return nil, 0, err
 		}
-		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequest(method, parsed.String(), reader)
-	if err != nil {
-		return nil, 0, err
-	}
-	if reader != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for name, value := range headers {
-		if name == "" || value == "" {
-			continue
+	target := parsed.String()
+	// Один HTTP-обмен. На HTTP 429 лимитер вызывает его ещё раз, поэтому запрос и reader тела
+	// собираются заново на каждую попытку.
+	exchange := func() exchangeResult {
+		var reader io.Reader
+		if payload != nil {
+			reader = bytes.NewReader(payload)
 		}
-		req.Header.Set(name, value)
+		req, reqErr := http.NewRequest(method, target, reader)
+		if reqErr != nil {
+			return exchangeResult{err: reqErr}
+		}
+		if reader != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for name, value := range headers {
+			if name == "" || value == "" {
+				continue
+			}
+			req.Header.Set(name, value)
+		}
+		resp, doErr := httpClient.Do(req)
+		if doErr != nil {
+			return exchangeResult{err: doErr}
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return exchangeResult{status: resp.StatusCode, header: resp.Header, err: readErr}
+		}
+		return exchangeResult{status: resp.StatusCode, header: resp.Header, body: body}
 	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return body, resp.StatusCode, nil
+	result := c.requestLimiter().run(classifyRequest(relative.EscapedPath()), exchange)
+	return result.body, result.status, result.err
 }
 
 func parseEnvelope(body []byte, httpStatus int) (ResultData, error) {
@@ -523,8 +549,8 @@ func (c *Client) RequestBinary(uri string) ([]byte, error) {
 	return body, nil
 }
 
-// MaxProxyDownloadExtLength — предел длины ext на выгрузках, как на сервере
-// (ResidentUserApiService.downloadProxyList: `e.length() > 250`).
+// MaxProxyDownloadExtLength — предел длины ext на выгрузках: значение длиннее 250 символов
+// сервер отбивает.
 const MaxProxyDownloadExtLength = 250
 
 // forbiddenExtRunes — символы, которые сервер в ext не пропускает: ими подставляют
@@ -538,8 +564,8 @@ var forbiddenExtRunes = []string{"\r", "\n", "/", "\\"}
 // либо "ext contains forbidden characters"). Такой ответ не разбирается в APIError, и вызывающий
 // получает невнятную ошибку разбора вместо понятной причины.
 //
-// Длину считаем в рунах: на сервере это String.length() (UTF-16), для ASCII-шаблонов
-// (а ext — это txt/csv либо шаблон из %ip%/%port%/%login%/...) значения совпадают.
+// Длину считаем в рунах: для ASCII-шаблонов (а ext — это txt/csv либо шаблон из
+// %ip%/%port%/%login%/...) это ровно тот счёт, по которому отбивает сервер.
 func assertExt(ext string) error {
 	if ext == "" {
 		return nil
@@ -558,8 +584,8 @@ func assertExt(ext string) error {
 /////////////////////////////// Auth ///////////////////////////////
 
 // AuthList Get auths.
-// data — голый массив (AuthListResponseClientDto.data — List<AuthItemClientDto>), без обёртки
-// items. Элементы: id (ObjectId string), active, login, password, ip, orderNumber.
+// data — голый массив авторизаций, без обёртки items. Элементы: id (ObjectId string), active,
+// login, password, ip, orderNumber.
 //
 // Неэкспортируемая обёртка authList, которая заворачивала результат в {"items": ...}, удалена:
 // это была форма v1, на неё никто не ссылался, и она противоречила фактическому ответу.
@@ -635,8 +661,8 @@ func (c *Client) Balance() (float64, error) {
 // Returns data.url — a link to the payment page of the chosen payment system.
 //
 // paymentId — ObjectId string from balance/payments/list. paymentCode здесь НЕ работает:
-// ClientApiService.addBalance сверяет только id и не зовёт normalizeOrderReferenceCodes
-// (см. AddBalance). Старая подпись глотает ошибку — используйте BalanceAddE.
+// balance/add принимает только id платёжной системы и код не резолвит (см. AddBalance).
+// Старая подпись глотает ошибку — используйте BalanceAddE.
 func BalanceAdd(summ float64, paymentId string) string {
 	value, _ := legacyClient().AddBalance(summ, paymentId)
 	return value
@@ -650,11 +676,9 @@ func (c *Client) AddBalance(summ float64, paymentID string) (string, error) {
 	if paymentID == "" {
 		paymentID = c.GetPaymentID()
 	}
-	// balance/add — единственная точка, где paymentCode НЕ работает.
-	// ClientApiService.addBalance ищет платёжку строго как
-	// availableBalancePaymentSystems(userId).find { it.id == dto.paymentId } и НЕ зовёт
-	// normalizeOrderReferenceCodes / resolvePaymentSystemByClientCode (в отличие от
-	// order/calc, order/make и prolong/*). Раньше при заданном только paymentCode SDK
+	// balance/add — единственная точка, где paymentCode НЕ работает: сервер ищет платёжку
+	// строго по paymentId среди систем из balance/payments/list и код не резолвит (в отличие
+	// от order/calc, order/make и prolong/*). Раньше при заданном только paymentCode SDK
 	// уезжал с paymentId="" и получал невнятное "paymentId not exists".
 	if paymentID == "" {
 		if code := c.GetPaymentCode(); code != "" {
@@ -673,8 +697,10 @@ func (c *Client) AddBalance(summ float64, paymentID string) (string, error) {
 	return value, nil
 }
 
-// BalancePaymentsList List of payment systems for balance replenishing.
-// data.items[].id — ObjectId string, not a number (BalancePaymentItemClientDto.id is String).
+// BalancePaymentsList List of payment systems for balance replenishing (AddBalance).
+// data.items[].id — ObjectId string, not a number.
+// It is NOT the list of ways to pay for orders: it never contains the balance itself, and order/make
+// and prolong/* accept only "balance" and "paddle_subscription" — see SetPaymentCode.
 // return array Example items:
 // [
 //
@@ -703,7 +729,7 @@ func (c *Client) BalancePaymentsList() ([]interface{}, error) {
 
 /////////////////////////////// Balance auto top-up ///////////////////////////////
 
-// AutoTopupSetRequest — тело POST balance/autotopup/set (AutoTopupSetRequestClientDto).
+// AutoTopupSetRequest — тело POST balance/autotopup/set.
 //
 // PARTIAL UPDATE: сервер меняет только те поля, которые реально пришли в JSON, остальные
 // берёт из сохранённых настроек. Поэтому все поля — указатели с omitempty: не заданное поле
@@ -716,7 +742,7 @@ func (c *Client) BalancePaymentsList() ([]interface{}, error) {
 // 52 amount below threshold, 53 no payment method, 56 payment method invalid.
 //
 // Полей dailyCountCap и monthlyAmountCap здесь БОЛЬШЕ НЕТ: 18.08.2026 их убрали из
-// AutoTopupSetRequestClientDto, присланные сервер игнорирует. Коды 54 и 55 удалены и не
+// контракта, присланные сервер игнорирует. Коды 54 и 55 удалены и не
 // переиспользуются. Раньше SDK их объявлял, проверял и отправлял — вызов с ними проходил
 // локальный гейт, возвращал success и не делал ничего.
 type AutoTopupSetRequest struct {
@@ -731,7 +757,7 @@ type AutoTopupSetRequest struct {
 	SubscriptionID *string `json:"subscriptionId,omitempty"`
 }
 
-// AutoTopupPaymentMethod — привязанный платёжный метод (AutoTopupPaymentMethodClientDto).
+// AutoTopupPaymentMethod — привязанный платёжный метод (paymentMethod в ответах balance/autotopup/*).
 type AutoTopupPaymentMethod struct {
 	// ID — id подписки Paddle; его же можно отправить обратно в AutoTopupSetRequest.SubscriptionID.
 	ID string `json:"id,omitempty"`
@@ -747,26 +773,24 @@ type AutoTopupPaymentMethod struct {
 	Exp string `json:"exp,omitempty"`
 }
 
-// AutoTopupLastEvent — последнее срабатывание (AutoTopupLastEventClientDto).
+// AutoTopupLastEvent — последнее срабатывание (lastEvent в ответах balance/autotopup/*).
 type AutoTopupLastEvent struct {
-	// Status — TRIGGERED | SUCCEEDED | FAILED | SKIPPED_CAP | SETTINGS_SAVED | PAUSED
-	// (enum AutoTopupEventStatus).
+	// Status — TRIGGERED | SUCCEEDED | FAILED | SKIPPED_CAP | SETTINGS_SAVED | PAUSED.
 	Status string   `json:"status,omitempty"`
 	Amount *float64 `json:"amount,omitempty"`
-	// At — дата события. Сервер отдаёт java.util.Date, формат зависит от конфигурации
-	// Jackson, поэтому SDK его не парсит.
+	// At — дата события, строка date-time в ISO 8601 ("2026-08-30T12:00:00.000+00:00").
+	// SDK её не парсит и отдаёт как пришла.
 	At interface{} `json:"at,omitempty"`
 	// Reason — причина неудачи/пропуска; null для SUCCEEDED.
 	Reason string `json:"reason,omitempty"`
 }
 
-// AutoTopupState — data обоих ответов, get и set (AutoTopupStateClientDto).
+// AutoTopupState — data обоих ответов, get и set.
 // set отдаёт состояние ПОСЛЕ сохранения, второй запрос за актуальным состоянием не нужен.
 type AutoTopupState struct {
 	Configured bool `json:"configured"`
 	Enabled    bool `json:"enabled"`
-	// State — NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID | PAUSED_FAILURES
-	// (enum AutoTopupState на сервере).
+	// State — NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID | PAUSED_FAILURES.
 	State          string                  `json:"state,omitempty"`
 	Threshold      *float64                `json:"threshold,omitempty"`
 	Amount         *float64                `json:"amount,omitempty"`
@@ -774,14 +798,14 @@ type AutoTopupState struct {
 	PaymentMethod  *AutoTopupPaymentMethod `json:"paymentMethod,omitempty"`
 	// FailCount — подряд идущие неудачные попытки списания.
 	FailCount int `json:"failCount"`
-	// LastAttemptAt — java.util.Date с сервера; SDK не парсит (см. AutoTopupLastEvent.At).
+	// LastAttemptAt — дата последней попытки; SDK её не парсит (см. AutoTopupLastEvent.At).
 	LastAttemptAt interface{}         `json:"lastAttemptAt,omitempty"`
 	LastEvent     *AutoTopupLastEvent `json:"lastEvent,omitempty"`
 }
 
 // AutoTopupLimits — границы значений из errors[].customData ответа balance/autotopup/set.
-// Ключи задаёт ClientApiService.setAutoTopup: minAmount, minThreshold. Присутствуют только те,
-// что относятся к сработавшей проверке. Ключа minDailyCountCap больше нет — дневной лимит
+// Ключи — minAmount и minThreshold; присутствуют только те, что относятся к сработавшей
+// проверке. Ключа minDailyCountCap больше нет — дневной лимит
 // удалён из контракта вместе с полем dailyCountCap.
 type AutoTopupLimits struct {
 	MinAmount    *float64
@@ -839,8 +863,8 @@ func autoTopupLimitFloat(data map[string]interface{}, key string) (float64, bool
 }
 
 // AutoTopupGet Get auto top-up configuration (GET balance/autotopup/get).
-// Если фича выключена Property-флагом enabled_autopopup_balance, сервер отвечает
-// ошибкой 49 "Auto top-up is not available".
+// Если авто-пополнение для аккаунта недоступно, сервер отвечает ошибкой 49
+// "Auto top-up is not available".
 func AutoTopupGet() (*AutoTopupState, error) { return legacyClient().GetAutoTopup() }
 
 func (c *Client) GetAutoTopup() (*AutoTopupState, error) {
@@ -903,7 +927,7 @@ func String(value string) *string    { return &value }
 // result.Map под именем типа. Чтения "как будто обёртки нет" на типизированном маршруте
 // (result.Map["country"]) дают nil.
 //
-// What the reference really carries, field by field (ClientApiService.buildLegacyReferenceItem):
+// What the reference really carries, field by field:
 //
 //	country[]                  id, name, alpha3         → alpha3 IS the country code
 //	period[]                   id, name                 → id is the period code ("1m")
@@ -933,9 +957,8 @@ func (c *Client) ReferenceList(proxyType string) (map[string]interface{}, error)
 // Preliminary order calculation
 // An error in warning must be corrected before placing an order.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -966,9 +989,8 @@ func (c *Client) OrderCalcIpv4(countryId string, periodId string, quantity int, 
 // Preliminary order calculation
 // An error in warning must be corrected before placing an order.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -998,12 +1020,9 @@ func (c *Client) OrderCalcIsp(countryId string, periodId string, quantity int, a
 // OrderCalcMix Calculate the order Mix
 // Preliminary order calculation
 // An error in warning must be corrected before placing an order.
-// For mix, countryId doubles as the MIX package selector: the package id, or "packageId:quantity"
-// (ClientApiService.parseMixSelection). The mix tag also fits, since the id fallback resolves it.
-// @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// @param string mix - the MIX package, sent as mixId: its ObjectId or its code, both from
+// reference/list/mix → quantities[].id (e.g. "europe-2-mix_IPv4"). A value that is not an
+// ObjectId is resolved as a code by the server.
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1034,9 +1053,8 @@ func (c *Client) OrderCalcMix(mix string, periodId string, quantity int, authori
 // Preliminary order calculation
 // An error in warning must be corrected before placing an order.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1044,7 +1062,7 @@ func (c *Client) OrderCalcMix(mix string, periodId string, quantity int, authori
 // @param string coupon - optional, pass "" when not needed
 // @param string customTargetName - required for ipv4/ipv6/isp and for unresolved mix/mix_isp
 // @param string protocol - http | https | socks | socks5 (case-insensitive), or "" for the default
-// (https). Anything else is rejected with "Incorrect protocol", code 13 (parseClientApiProtocol).
+// (https). Anything else is rejected with "Incorrect protocol", code 13.
 // @return array Example
 // [
 //
@@ -1070,20 +1088,20 @@ func (c *Client) OrderCalcIpv6(countryId string, periodId string, quantity int, 
 // An error in warning must be corrected before placing an order.
 // This helper always sends mobileServiceType=dedicated; for shared use CalculateOrder.
 // Reference ids may be replaced by stable codes right here, positionally — the server resolves
-// a *Id value that is not an ObjectId as a code (ClientApiService.normalizeOrderReferenceCodes),
-// so the *Code fields of OrderRequest are never required for that.
+// a *Id value that is not an ObjectId as a code, so the *Code fields of OrderRequest are never
+// required for that.
 // @param string countryId - ObjectId string OR country code (alpha3, uppercased by the server: "USA")
 // @param string periodId - ObjectId string OR period code (lowercased by the server: "1m", "3m")
 // @param integer quantity
 // @param string authorization - optional, pass "" when not needed
 // @param string coupon - optional, pass "" when not needed
-// @param string operatorId - ObjectId string OR operator tag (matched by MobileOperator.tag);
+// @param string operatorId - ObjectId string OR operator tag (exact, case-sensitive match);
 // the id comes from reference/list/mobile → country[].operators.dedicated[].id
 // @param string rotationId - rotation interval in MINUTES, as a numeric string: "5", "10", "0" = By Link,
 // "" = not set. Values come from reference/list/mobile → operators[].rotations[].id, which is the
-// minute count itself. There are no rotation codes and no code fallback here: the server does
-// `requestDto.rotationId as int`, so "5m" is not a rotation — it throws and the envelope comes back
-// as "Unknown error", code 35.
+// minute count itself. There are no rotation codes and no code fallback here: the server reads
+// rotationId only as a whole number, so "5m" is not a rotation — the request fails with
+// "Unknown error", code 35.
 // @return array Example
 // [
 //
@@ -1108,7 +1126,7 @@ func (c *Client) OrderCalcMobile(countryId string, periodId string, quantity int
 // Preliminary order calculation
 // An error in warning must be corrected before placing an order.
 // @param string tarifId - ObjectId string from reference/list/resident → tarifs[].id, OR the tariff
-// code (ResidentTariffPlan.code, exact match). Careful: the code is NOT published by the reference —
+// code (exact match). Careful: the code is NOT published by the reference —
 // tarifs[] carries only id, name and personal — so unless you know the code from elsewhere, use the id.
 // @param string coupon - optional, pass "" when not needed
 // @return array Example
@@ -1135,9 +1153,8 @@ func (c *Client) OrderCalcResident(tarifId string, coupon string) (map[string]in
 // Attention! Calling this method will deduct $ from your balance!
 // The parameters are identical to the /order/calc method. Practice there before calling the /order/make method.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1164,9 +1181,8 @@ func (c *Client) OrderMakeIpv4(countryId string, periodId string, quantity int, 
 // Attention! Calling this method will deduct $ from your balance!
 // The parameters are identical to the /order/calc method. Practice there before calling the /order/make method.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1192,11 +1208,7 @@ func (c *Client) OrderMakeIsp(countryId string, periodId string, quantity int, a
 // OrderMakeMix Create an order Mix
 // Attention! Calling this method will deduct $ from your balance!
 // The parameters are identical to the /order/calc method. Practice there before calling the /order/make method.
-// For mix, countryId doubles as the MIX package selector — see OrderCalcMix.
-// @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// @param string mix - the MIX package (ObjectId or code), sent as mixId — see OrderCalcMix.
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1223,9 +1235,8 @@ func (c *Client) OrderMakeMix(mix string, periodId string, quantity int, authori
 // Attention! Calling this method will deduct $ from your balance!
 // The parameters are identical to the /order/calc method. Practice there before calling the /order/make method.
 // @param string countryId - ObjectId string from reference/list (v2 ids are not numbers) OR the
-// country code: a *Id value that is not an ObjectId is resolved as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The code is the alpha3 from
-// reference/list → country[].id, uppercased by the server ("USA").
+// country code: a *Id value that is not an ObjectId is resolved as a code by the server.
+// The code is the alpha3 from reference/list → country[].id, uppercased by the server ("USA").
 // @param string periodId - ObjectId string from reference/list OR the period code, lowercased by
 // the server ("1m", "3m"). reference/list → period[].id is that code.
 // @param integer quantity
@@ -1280,7 +1291,7 @@ func (c *Client) OrderMakeMobile(countryId string, periodId string, quantity int
 // Attention! Calling this method will deduct $ from your balance!
 // The parameters are identical to the /order/calc method. Practice there before calling the /order/make method.
 // @param string tarifId - ObjectId string from reference/list/resident → tarifs[].id, OR the tariff
-// code (ResidentTariffPlan.code, exact match). Careful: the code is NOT published by the reference —
+// code (exact match). Careful: the code is NOT published by the reference —
 // tarifs[] carries only id, name and personal — so unless you know the code from elsewhere, use the id.
 // @param string coupon - optional, pass "" when not needed
 // @return array Example
@@ -1312,9 +1323,8 @@ func (c *Client) prepareRegular(sectionCode string, countryId string, periodId s
 	return c.withPayment(data)
 }
 
-// prepareMix — заказ MIX-пакета. Идентификатор пакета идёт в mixId, а не в countryId:
-// parseMixSelection ищет пакет через findById(mixId), а тег в ObjectId переводит
-// normalizeOrderReferenceCodes — тоже только для mixId.
+// prepareMix — заказ MIX-пакета. Идентификатор пакета идёт в mixId, а не в countryId: сервер
+// ищет пакет по mixId и только там же принимает вместо ObjectId код пакета.
 func (c *Client) prepareMix(sectionCode string, mix string, periodId string, quantity int, authorization string, coupon string, customTargetName string) map[string]interface{} {
 	data := map[string]interface{}{
 		"sectionCode":      sectionCode,
@@ -1343,7 +1353,7 @@ func (c *Client) prepareIpv6(countryId string, periodId string, quantity int, au
 }
 
 // prepareMobile — коды кладём прямо в *Id-поля: сервер резолвит значение, не являющееся id,
-// как код (normalizeOrderReferenceCodes), поэтому *Code-поля здесь не нужны. Исключение —
+// как код, поэтому *Code-поля здесь не нужны. Исключение —
 // rotationId: это минуты числом ("5", "0" = By Link), у него нет ни кода, ни фолбэка.
 func (c *Client) prepareMobile(countryId string, periodId string, quantity int, authorization string, coupon string, operatorId string, rotationId string) map[string]interface{} {
 	data := map[string]interface{}{
@@ -1369,8 +1379,8 @@ func (c *Client) prepareResident(tarifId string, coupon string) map[string]inter
 	return c.withPayment(data)
 }
 
-// withPayment — paymentCode/paymentId заказа. Здесь код действительно резолвится сервером
-// (ClientApiService.normalizeOrderReferenceCodes), в отличие от balance/add.
+// withPayment — paymentCode/paymentId заказа. Здесь код действительно резолвится сервером,
+// в отличие от balance/add.
 func (c *Client) withPayment(data map[string]interface{}) map[string]interface{} {
 	if code := c.GetPaymentCode(); code != "" {
 		data["paymentCode"] = code
@@ -1416,12 +1426,11 @@ func isMixSection(sectionCode string) bool {
 	return false
 }
 
-// mixResolvedLocally повторяет ClientApiService.parseMixSelection: сервер распознаёт mix
-// не только по mixId/mixCode, но и через countryId — строкой "packageId:quantity" либо
-// countryId=packageId вместе с quantity. Если mix распознан, requiresClientApiGoal
-// возвращает false и цель НЕ требуется. Раньше здесь проверялись только mixId/mixCode,
-// из-за чего legacy-путь OrderCalcMix/OrderMakeMix (пакет уезжает в countryId) блокировался
-// локально и запрос вообще не уходил на сервер.
+// mixResolvedLocally повторяет правило сервера: mix распознаётся не только по mixId/mixCode,
+// но и через countryId — строкой "packageId:quantity" либо countryId=packageId вместе с
+// quantity. Если mix распознан, цель (customTargetName) НЕ требуется. Раньше здесь проверялись
+// только mixId/mixCode, из-за чего legacy-путь OrderCalcMix/OrderMakeMix (пакет тогда уезжал в
+// countryId) блокировался локально и запрос вообще не уходил на сервер.
 //
 // Сомнительные случаи трактуем в пользу отправки: лишний сетевой запрос дешевле,
 // чем отказ SDK на валидном заказе.
@@ -1517,33 +1526,18 @@ func (c *Client) withGenerateAuth(data map[string]interface{}) map[string]interf
 	return data
 }
 
-// requiresFingerprint — секции, для которых сервер без X-Fingerprint заказ НЕ создаёт:
-// OrderService.createResidentOrder / createScraperOrder резолвят отпечаток из заголовка и
-// отвечают "Header X-Fingerprint is required". Остальные секции его игнорируют.
-func requiresFingerprint(sectionCode string) bool {
-	switch strings.TrimSpace(sectionCode) {
-	case "resident", "scraper":
-		return true
-	}
-	return false
-}
-
-// orderMakeHeaders — заголовки order/make: X-Fingerprint, когда значение задано (для ЛЮБОЙ
-// секции — слать его всегда безопасно), и локальный отказ, когда оно не задано, а заказ
-// резидентский либо скраперный. Проверяем до запроса, как и остальные обязательные поля:
-// без отпечатка такой заказ гарантированно не создастся.
-func (c *Client) orderMakeHeaders(sectionCode string, override string) (map[string]string, error) {
+// orderMakeHeaders — заголовки order/make: X-Fingerprint для ЛЮБОЙ секции, когда значение задано
+// (override — значение на один вызов, иначе значение клиента). Без значения заголовок не шлётся
+// вовсе, и это не ошибка: заголовок необязателен, без него сервер заказ не отбивает.
+func (c *Client) orderMakeHeaders(override string) map[string]string {
 	fingerprint := strings.TrimSpace(override)
 	if fingerprint == "" {
 		fingerprint = c.GetFingerprint()
 	}
 	if fingerprint == "" {
-		if requiresFingerprint(sectionCode) {
-			return nil, fmt.Errorf("order/make: X-Fingerprint is required for %s orders (the server replies \"Header X-Fingerprint is required\" and creates nothing): set a stable identifier of this installation with NewClient(key, WithFingerprint(...)) or SetFingerprint(...), or pass OrderRequest.Fingerprint for a single call", strings.TrimSpace(sectionCode))
-		}
-		return nil, nil
+		return nil
 	}
-	return map[string]string{FingerprintHeader: fingerprint}, nil
+	return map[string]string{FingerprintHeader: fingerprint}
 }
 
 // Create an order
@@ -1551,30 +1545,23 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 	if err := requireCustomTargetName(data); err != nil {
 		return nil, err
 	}
-	section, _ := data["sectionCode"].(string)
-	headers, err := c.orderMakeHeaders(section, "")
-	if err != nil {
-		return nil, err
-	}
-	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.withGenerateAuth(data), headers)
+	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.withGenerateAuth(data), c.orderMakeHeaders(""))
 	return result.Map, err
 }
 
 // OrderList Orders list
 // Шорткат без фильтров, как ProxyList: вся десятка живёт в OrderListOptions (см. ListOrders).
 //
-// id, order_id, order_number, base_order_number и items[].id / items[].order_part_id — СТРОКИ
-// (OrderListItemClientDto и OrderListPositionClientDto объявляют их String). id — легаси-число
-// битрикса либо детерминированный суррогат от base_order_number, тоже строкой; наш ObjectId лежит
-// в order_id, и это тот же order_id, что отдаёт proxy/list.
+// id, order_id, order_number, base_order_number и items[].id / items[].order_part_id — СТРОКИ.
+// id — числовой номер заказа, переданный строкой. ObjectId заказа лежит в order_id: это тот же
+// order_id, что отдаёт proxy/list, и именно его принимает ProlongRequest.OrderIDs.
 //
-// summ и items[].price — ТОЖЕ строки, уже с валютой: "$25.00", формат v1
-// (CCurrencyLang::CurrencyFormat). auto_order и is_extend — "Y"/"N", а не bool. Даты —
-// ISO 8601 со смещением ("2026-09-01T14:15:26+00:00"), date_payed null, пока заказ не оплачен.
+// summ и items[].price — ТОЖЕ строки, уже с валютой: "$25.00". auto_order и is_extend — "Y"/"N",
+// а не bool. Даты — ISO 8601 со смещением ("2026-09-01T14:15:26+00:00"), date_payed null, пока
+// заказ не оплачен. Имена фильтров и полей ответа — snake_case (см. OrderListOptions).
 //
-// Ответ, в отличие от proxy/list, всегда завёрнут в metadata + items — форма v1, потому что ту же
-// выдачу через обратное зеркало получают клиенты легаси-API. metadata приходит и без пагинации:
-// тогда total_pages = 1, current_limit = 0, а в items лежит весь список.
+// Ответ, в отличие от proxy/list, всегда завёрнут в metadata + items. metadata приходит и без
+// пагинации: тогда total_pages = 1, current_limit = 0, а в items лежит весь список.
 // @return array Example
 // [
 //
@@ -1585,8 +1572,8 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 //	    'current_limit' => 20, // 0 — выдача без пагинации
 //	],
 //	'items' => [[
-//	    'id' => '1000500',                             // легаси-число битрикса, строкой
-//	    'order_id' => '68b1f0c4e13a4c0f1a2b3c11',      // наш ObjectId, он же order_id в proxy/list
+//	    'id' => '1000500',                             // числовой номер заказа, строкой
+//	    'order_id' => '68b1f0c4e13a4c0f1a2b3c11',      // ObjectId заказа, он же order_id в proxy/list
 //	    'order_number' => 'LH-100500_e_9f2c',          // у продления есть хвост _e_<hash>
 //	    'base_order_number' => 'LH-100500',
 //	    'auto_order' => 'N',      // "Y" — у заказа включено автопродление
@@ -1603,7 +1590,7 @@ func (c *Client) orderMake(data map[string]interface{}) (map[string]interface{},
 //	    'auth_ip' => '1.2.3.4',
 //	    'summ' => '$25.00',       // строка с валютой, не число
 //	    'items' => [[
-//	        'id' => '2000600',                              // легаси-id корзины, строкой
+//	        'id' => '2000600',                              // числовой id позиции, строкой
 //	        'order_part_id' => '68b1f0c4e13a4c0f1a2b3c22',  // он же basket_id в proxy/list
 //	        'type' => 'ipv4',
 //	        'ips' => ['1.2.3.4'], // честный пустой массив, пока адреса не выданы
@@ -1631,12 +1618,11 @@ func (c *Client) OrderList() (map[string]interface{}, error) {
 
 // ProxyList Proxies list
 // @param string proxyType - ipv4 | ipv6 | mobile | isp | mix | ""
-// id, order_id, order_number and basket_id are ObjectId strings (ProxyListItemClientDto
-// declares all of them as String) — never parse them as numbers.
+// id, order_id, order_number and basket_id are ObjectId strings — never parse them as numbers.
 //
-// Порты — ВСЕГДА строки, как в v1: ProxyListItemClientDto.port_socks / port_http объявлены
-// String, и у адреса без порта (например ipv6) приходит "", а не null и не 0. rotation, наоборот,
-// число: Integer, то есть int|null — интервал ротации мобильного прокси в минутах.
+// Порты — ВСЕГДА строки, как в v1: port_socks / port_http приходят JSON-строками, и у адреса без
+// порта (например ipv6) приходит "", а не null и не 0. rotation, наоборот, число или null —
+// интервал ротации мобильного прокси в минутах.
 // @return array Example
 // [
 //
@@ -1683,8 +1669,8 @@ func (c *Client) ProxyList(proxyType string) (map[string]interface{}, error) {
 // $param string listId - only for resident, if not set - will return ip from all sheets
 //
 // package_key is NOT a parameter here: only proxy/download/subresident reads it. The literal
-// route proxy/download/resident is served by ResidentUserController.downloadProxyList, which
-// accepts listId/id/ext/maxLine only and exports the parent package. Use
+// route proxy/download/resident accepts listId/id/ext/maxLine only and exports the parent
+// package. Use
 // DownloadProxies("subresident", ProxyDownloadOptions{PackageKey: ...}) for a subpackage.
 //
 // An oversized or malformed ext (see assertExt) is rejected by the server with a bare
@@ -1739,10 +1725,9 @@ func splitIDs(ids string) []string {
 /////////////////////////////// Resident ///////////////////////////////
 
 // ResidentPackage Package Information
-// Remaining traffic, end date. Traffic values are strings in the response
-// (PackageResponseDto declares traffic_limit/traffic_usage/traffic_left as String),
-// expired_at is a formatted string "d.m.Y H:i:s" — unlike the SUBPACKAGE expired_at,
-// which is a PHP date object (see ResidentsubuserPackages).
+// Remaining traffic, end date. Traffic values (traffic_limit, traffic_usage, traffic_left) are
+// strings in the response, expired_at is a formatted string "d.m.Y H:i:s" — unlike the SUBPACKAGE
+// expired_at, which is a date object {date, timezone_type, timezone} (see ResidentsubuserPackages).
 // @return array Example
 // [
 //
@@ -1767,7 +1752,7 @@ func (c *Client) ResidentPackage() (map[string]interface{}, error) {
 // ResidentGeo Full geo structure (countries -> regions -> cities -> ISPs).
 //
 // The server answers with a JSON FILE — Content-Type application/json,
-// Content-Disposition: attachment; filename="geo.json" (ResidentUserApiService.downloadGeoFile).
+// Content-Disposition: attachment; filename="geo.json".
 // It is NOT a zip archive, despite what the older SDK docs claimed: the body is
 // pretty-printed JSON you can unmarshal directly.
 // @return binary (geo.json contents)
@@ -1782,8 +1767,8 @@ func (c *Client) ResidentGeo() ([]byte, error) { return c.RequestBinary("residen
 
 // ResidentList List of existing ip list in a package
 // You can download the list via endpoint /proxy/download/resident?listId=123
-// Element ids are numeric (ListItemResponseDto.id is Long) — resident list ids are the one
-// exception to the "ids are ObjectId strings" rule of v2.
+// Element ids are JSON numbers (64-bit integers) — resident list ids are the one exception to the
+// "ids are ObjectId strings" rule of v2.
 // @return array
 func ResidentList() ([]interface{}, error) { return legacyClient().ResidentLists() }
 
@@ -1803,7 +1788,7 @@ func (c *Client) ResidentListAdd(title string, whitelist string, country string,
 }
 
 // ResidentListRename Rename list in user package
-// @param int64 id - listId (ListRenameRequestDto.id is Long)
+// @param int64 id - listId, sent as a JSON number
 // @param string title
 // @return array Updated list model
 func ResidentListRename(id int64, title string) (map[string]interface{}, error) {
@@ -1820,7 +1805,7 @@ func (c *Client) ResidentListRename(id int64, title string) (map[string]interfac
 }
 
 // ResidentListDelete Remove list from user package
-// @param int64 id - listId (ListDeleteRequestDto.id is Long)
+// @param int64 id - listId, sent as a JSON number
 // data приходит СТРОКОЙ "delete", а не объектом — см. deleteResultMap.
 // @return array Delete result
 func ResidentListDelete(id int64) (map[string]interface{}, error) {
@@ -1840,8 +1825,8 @@ func (c *Client) ResidentListDelete(id int64) (map[string]interface{}, error) {
 // ResidentsubuserPackages Package Information
 // Remaining traffic, expiration date.
 //
-// Внимание на expired_at: у СУБПАКЕТА это не строка, а ОБЪЕКТ PHP-даты
-// (SubPackageDto.expired_at имеет тип PhpDateDto) — {date, timezone_type, timezone}.
+// Внимание на expired_at: у СУБПАКЕТА это не строка, а объект даты {date, timezone_type, timezone}:
+// date — UTC в формате yyyy-MM-dd HH:mm:ss.SSSSSS, timezone_type всегда 3, timezone всегда UTC.
 // Строкой "d.m.Y H:i:s" приходит только expired_at родительского пакета
 // (resident/package). Traffic-поля здесь тоже строки, а не числа.
 //
@@ -1878,11 +1863,11 @@ func (c *Client) ResidentsubuserPackages() ([]interface{}, error) {
 // 1...3600 interval in seconds
 //
 // @param integer rotation -1...3600
-// @param integer traffic_limit - in bytes (sent as a string, the server field is String)
+// @param integer traffic_limit - in bytes (sent as a JSON string, which is what the server expects)
 // @param string expired_at - "" не отправляется вовсе: сервер отличает отсутствие поля от
 // присланного значения, и пустая строка означала бы "менять дату", а не "не задано".
 // @param options - необязательные поля, которых нет в позиционной подписи (WithSubuserLinkDate)
-// @return array Example (expired_at приходит объектом PHP-даты, см. ResidentsubuserPackages)
+// @return array Example (expired_at приходит объектом даты {date, timezone_type, timezone}, см. ResidentsubuserPackages)
 // [
 //
 //	'package_key': 'f9ea7063d7a699b12b3e',
@@ -1941,8 +1926,8 @@ func WithSubuserLinkDate(linkDate bool) ResidentSubuserOption {
 // 0 Every request
 // 1...3600 interval in seconds
 //
-// Обновление ЧАСТИЧНОЕ: сервер меняет только те поля, которые реально пришли в теле
-// (ResidentSubPackageService.updateSubPackage сверяет каждое с null). Поэтому обёртка не
+// Обновление ЧАСТИЧНОЕ: сервер меняет только те поля, которые реально пришли в теле, а
+// отсутствующие оставляет как есть. Поэтому обёртка не
 // отправляет expired_at, если он пуст, и traffic_limit, если он не положителен: раньше уезжали
 // "" и "0", и сервер трактовал их как присланные значения — пустая дата молча переносила
 // окончание субпакета на дату родительского, а "0" отбивался "Set [traffic_limit > 0]".
@@ -1950,13 +1935,13 @@ func WithSubuserLinkDate(linkDate bool) ResidentSubuserOption {
 // всегда; чтобы изменить ровно одно поле, используйте UpdateResidentSubuser.
 //
 // @param integer rotation -1...3600
-// @param integer traffic_limit - in bytes (sent as a string, the server field is String);
-// 0 и меньше — "не менять"
+// @param integer traffic_limit - in bytes (sent as a JSON string, which is what the server
+// expects); 0 и меньше — "не менять"
 // @param string expired_at - "" означает "не менять"
 // @param bool is_active
 // @param string package_key
 // @param options - необязательные поля, которых нет в позиционной подписи (WithSubuserLinkDate)
-// @return array Example (expired_at приходит объектом PHP-даты, см. ResidentsubuserPackages)
+// @return array Example (expired_at приходит объектом даты {date, timezone_type, timezone}, см. ResidentsubuserPackages)
 // [
 //
 //	'package_key': 'f9ea7063d7a699b12b3e',
@@ -2031,7 +2016,7 @@ func (c *Client) ResidentsubuserListAdd(package_key string, title string, whitel
 }
 
 // ResidentsubuserListRename Rename list in subuser package
-// @param integer id - listId (RenameSubPackageListRequestDto.id is Integer)
+// @param integer id - listId, sent as a JSON number (32-bit integer)
 // @param string title
 // @param string package_key
 // @return array Updated list model
@@ -2050,9 +2035,8 @@ func (c *Client) ResidentsubuserListRename(package_key string, id int, title str
 }
 
 // ResidentsubuserListDelete Remove list from subuser package
-// @param string id - listId. Здесь именно СТРОКА: DeleteSubPackageListRequestDto.id
-// объявлен как String с @NotBlank, в отличие от rename/rotation того же субпакета
-// (там Integer) и от resident/list/* (там Long).
+// @param string id - listId. Здесь именно СТРОКА, причём непустая, в отличие от
+// rename/rotation того же субпакета (там 32-битное целое) и от resident/list/* (там 64-битное).
 // @param string package_key
 // @return array Delete result, e.g. ['status' => 'delete'] или ['status' => 'not-found']
 func ResidentsubuserListDelete(package_key string, id string) (map[string]interface{}, error) {
@@ -2112,7 +2096,7 @@ func (c *Client) AuthDelete(id string) (map[string]interface{}, error) {
 	return result.Map, err
 }
 
-// Replacement reasons accepted by proxy/replace (enum ProxyReplaceType on the server).
+// Replacement reasons accepted by proxy/replace in its type field.
 const (
 	ProxyReplaceReasonNotWork           = "NOT_WORK"
 	ProxyReplaceReasonIncorrectLocation = "INCORRECT_LOCATION"
@@ -2130,9 +2114,9 @@ var ProxyReplaceReasons = []string{
 	ProxyReplaceReasonCustom,
 }
 
-// assertProxyReplaceReason повторяет две первые проверки ClientApiService.replaceProxies:
-// ProxyReplaceType.fromString (регистр не важен — сервер делает value.toUpperCase()) и
-// обязательный непустой comment при CUSTOM (иначе ошибка "Set comment", code 503).
+// assertProxyReplaceReason повторяет две первые проверки proxy/replace на сервере: причина
+// должна быть одной из ProxyReplaceReasons (регистр не важен — сервер принимает и "not_work"),
+// а при CUSTOM обязателен непустой comment (иначе ошибка "Set comment", code 503).
 func assertProxyReplaceReason(reason string, comment string) error {
 	normalized := strings.ToUpper(strings.TrimSpace(reason))
 	valid := false
@@ -2155,10 +2139,9 @@ func assertProxyReplaceReason(reason string, comment string) error {
 // ProxyReplace Replace proxy IPs.
 //
 // ВНИМАНИЕ: replaceReason (поле type в запросе) — это ПРИЧИНА замены, а НЕ тип прокси.
-// Сервер валидирует его через enum ProxyReplaceType:
-// NOT_WORK | INCORRECT_LOCATION | CANT_CHANGE_NETWORK | LOW_SPEED | CUSTOM,
-// и превращает в текст комментария заявки (ProxyReplaceType.legacyComment). Тип прокси здесь
-// вообще не передаётся: он определяется по первому IP из ids (ipAddresses[0].proxyTypeId).
+// Сервер принимает только NOT_WORK | INCORRECT_LOCATION | CANT_CHANGE_NETWORK | LOW_SPEED |
+// CUSTOM и превращает причину в текст комментария заявки. Тип прокси здесь вообще не
+// передаётся: сервер определяет его по первому прокси из ids.
 // При CUSTOM обязателен непустой comment, при остальных причинах comment необязателен.
 //
 // @param ids - ObjectId strings: одна строка с запятыми либо []string
@@ -2183,8 +2166,8 @@ func (c *Client) ProxyReplace(ids interface{}, replaceReason string, comment str
 
 // ProxyDownloadResident Export the resident proxy list.
 //
-// Маршрут /proxy/download/resident литеральный (ResidentUserController.downloadProxyList) и
-// принимает только listId (алиас id), ext и maxLine. package_key он ИГНОРИРУЕТ — выгрузится
+// Маршрут /proxy/download/resident литеральный и принимает только listId (алиас id), ext и
+// maxLine. package_key он ИГНОРИРУЕТ — выгрузится
 // родительский пакет. Для листа субпакета нужен другой маршрут:
 // DownloadProxies("subresident", ProxyDownloadOptions{ListID: ..., PackageKey: ...}).
 //
@@ -2230,9 +2213,8 @@ func (c *Client) ResidentConsumption(filter map[string]interface{}) (map[string]
 
 // ResidentTrafficDetails Detailed traffic statistics of the resident package.
 //
-// Ключ пакета здесь называется packageKey ЛИБО key — НЕ package_key
-// (ResidentUserApiService.getTrafficDetails: request.get("packageKey") ?: request.get("key")).
-// Он обязателен: без него сервер отвечает ошибкой "key is required".
+// Ключ пакета здесь называется packageKey ЛИБО key (если заданы оба, берётся packageKey) —
+// НЕ package_key. Он обязателен: без него сервер отвечает ошибкой "key is required".
 // Остальные фильтры: login, date_start, date_end.
 func ResidentTrafficDetails(filter map[string]interface{}) (map[string]interface{}, error) {
 	return legacyClient().ResidentTrafficDetails(filter)
@@ -2267,7 +2249,7 @@ func (c *Client) ResidentGeoCount() ([]interface{}, error) {
 
 // ResidentListRotation Change the rotation interval of a list
 // rotation: -1 sticky, 0 per request, 1-3600 seconds
-// @param int64 id - listId (ListRotationRequestDto.id is Long)
+// @param int64 id - listId, sent as a JSON number
 func ResidentListRotation(id int64, rotation int) (map[string]interface{}, error) {
 	return legacyClient().ResidentListRotation(id, rotation)
 }
@@ -2290,7 +2272,7 @@ func (c *Client) ResidentListTools() (map[string]interface{}, error) {
 }
 
 // ResidentsubuserListRotation Change the rotation interval of a list inside a subpackage
-// @param integer id - listId (ChangeSubPackageListRotationRequestDto.id is Integer)
+// @param integer id - listId, sent as a JSON number (32-bit integer)
 func ResidentsubuserListRotation(package_key string, id int, rotation int) (map[string]interface{}, error) {
 	return legacyClient().ResidentsubuserListRotation(package_key, id, rotation)
 }
@@ -2320,17 +2302,37 @@ func (c *Client) ResidentsubuserListTools(package_key string) (map[string]interf
 
 /////////////////////////////// Prolong ///////////////////////////////
 
-// splitProlongTargets разводит то, что пришло от вызывающего, на адреса и ObjectId.
+// normalizeProlongType — тип из пути так, как его читает сервер: без пробелов по краям, в нижнем
+// регистре, "-" и " " заменены на "_" (" Mix-ISP" → "mix_isp").
+func normalizeProlongType(proxyType string) string {
+	return strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(proxyType)))
+}
+
+// prolongIDField — поле тела prolong/*, в которое уходят id для этого типа:
 //
-// Клиенту удобнее всего продлевать по самим адресам — именно их он видит
-// в proxy/list и в выгрузке. Сервер принимает их в поле ips и сам переводит в ids
-// (ClientApiService.resolveProlongIpsToIds — вызывается безусловно и для calc, и для make).
-// Формат адреса зависит от типа: ipv4/isp/mix/mix_isp — "ip", mobile — "ip:port_http:port_socks"
-// (оба порта есть в proxy/list). Для ipv6 — тоже "ip": там уже лежит шлюз с портом
-// ("1.2.3.4:26000"), а "ip_only" — только шлюз, так что строка, которую сверяет сервер
-// (OldSellerService.formatIpForType), передаётся как есть.
-// ObjectId — 24 hex-символа без точек и двоеточий, поэтому одно от другого отличается
-// надёжно и смешанный список тоже работает.
+//	ipv4, isp, mobile  → "ipIds":    продление по отдельным прокси, это поле id из proxy/list;
+//	ipv6, mix, mix_isp → "orderIds": продаются и продлеваются только целым заказом, это поле
+//	                                 order_id из proxy/list или order/list;
+//	resident           → "":         выбора в теле нет вовсе (prolong/* для резидентки
+//	                                 сервер отбивает целиком).
+//
+// Прочие типы идут по первой ветке: что с ними делать, решает сервер.
+func prolongIDField(proxyType string) string {
+	switch normalizeProlongType(proxyType) {
+	case "ipv6", "mix", "mix_isp":
+		return "orderIds"
+	case "resident":
+		return ""
+	}
+	return "ipIds"
+}
+
+// splitProlongTargets разводит то, что пришло от вызывающего, на адреса и id.
+//
+// Адрес — строка с "." или ":" в том виде, в каком его отдаёт proxy/list: ipv4/isp — "ip",
+// mobile — "ip:port_http:port_socks" (оба порта есть в proxy/list). У ObjectId (24 hex-символа)
+// нет ни точек, ни двоеточий, поэтому одно от другого отличается надёжно. В какое поле уйдут
+// id — ipIds или orderIds, — и допустим ли смешанный список, решает тип (prepareLegacyProlong).
 func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
 	var items []string
 	switch value := ipsOrIds.(type) {
@@ -2363,37 +2365,57 @@ func splitProlongTargets(ipsOrIds interface{}) (ips []string, ids []string) {
 	return ips, ids
 }
 
-func (c *Client) prepareLegacyProlong(ipsOrIds interface{}, periodId string, coupon string) map[string]interface{} {
+// prepareLegacyProlong — тело позиционных ProlongCalc/ProlongMake.
+//
+// Адреса уходят в ips, остальные значения — в поле id этого типа: ipIds у ipv4/isp/mobile,
+// orderIds у ipv6/mix/mix_isp.
+//
+// ipv4/isp/mobile: список, в котором смешаны id прокси и адреса, отбивается ошибкой до запроса.
+// Получив оба поля, сервер продлевает по ipIds и молча игнорирует ips — адреса выпали бы из
+// оплаченного продления, и вызывающий об этом не узнал бы.
+//
+// ipv6/mix/mix_isp: адрес уходит в ips, в том числе вперемешку с id заказов. Сервер отбивает такой
+// запрос целиком с понятной причиной ("[ips] is not applicable for ipv6: prolong by [orderIds]"),
+// а SDK не пытается угадать заказ по адресу.
+//
+// resident: выбора в теле нет вовсе. prolong/* для резидентки сервер отбивает целиком
+// ("Create new order to add traffic, prolong options not available"), так что незаметно ничего
+// не продлится. Поля ids сервер больше не принимает, и SDK его не шлёт ни в какой ветке.
+func (c *Client) prepareLegacyProlong(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	data := map[string]interface{}{
 		"periodId": periodId,
 		"coupon":   coupon,
 	}
-	if ips, ids := splitProlongTargets(ipsOrIds); len(ips) > 0 || len(ids) > 0 {
+	if idField := prolongIDField(proxyType); idField != "" {
+		ips, ids := splitProlongTargets(ipsOrIds)
+		if idField == "ipIds" && len(ips) > 0 && len(ids) > 0 {
+			return nil, fmt.Errorf("prolong/%s: mixing proxy ids and addresses in one call is not supported: pass either ids or addresses (with both, the server renews by ipIds and silently ignores ips)", normalizeProlongType(proxyType))
+		}
 		if len(ips) > 0 {
 			data["ips"] = ips
 		}
 		if len(ids) > 0 {
-			data["ids"] = ids
+			data[idField] = ids
 		}
-	} else {
-		// Тип, который не разобрали, уходит как был — пусть ошибку назовёт сервер.
-		data["ids"] = normalizeIDs(ipsOrIds)
+		if len(ips) == 0 && len(ids) == 0 && ipsOrIds != nil {
+			// Значение, которое не разобрали, уходит как было — пусть ошибку назовёт сервер.
+			data[idField] = normalizeIDs(ipsOrIds)
+		}
 	}
-	// Здесь paymentCode резолвится сервером (normalizeProlongReferenceCodes), в отличие
-	// от balance/add.
+	// paymentCode здесь резолвится сервером — как у order/*, в отличие от balance/add.
 	if code := c.GetPaymentCode(); code != "" {
 		data["paymentCode"] = code
 	} else if id := c.GetPaymentID(); id != "" {
 		data["paymentId"] = id
 	}
-	return data
+	return data, nil
 }
 
-// normalizeIDs приводит "a,b,c" к []string. Ветка []int убрана осознанно: во всех DTO,
-// которые принимают ids (ProlongRequestClientDto.ids, ProxyReplaceRequestClientDto.ids,
-// ProxyCommentSetRequestClientDto.ids), это Set<String> с ObjectId внутри. Числовые id
-// остались только в v1, и превращение []int в ["1","2"] лишь маскировало ошибку вызывающего:
-// сервер всё равно не нашёл бы такие IP. Значения не-string теперь уходят как есть.
+// normalizeIDs приводит "a,b,c" к []string. Ветка []int убрана осознанно: во всех полях-списках
+// id (ids у proxy/replace и proxy/comment/set, ipIds и orderIds у prolong/* и autoprolong/*)
+// сервер ждёт строки ObjectId. Числовые id остались только в v1, и превращение []int в ["1","2"]
+// лишь маскировало ошибку вызывающего: сервер всё равно не нашёл бы такие прокси. Значения
+// не-string теперь уходят как есть.
 func normalizeIDs(ids interface{}) interface{} {
 	switch value := ids.(type) {
 	case string:
@@ -2404,59 +2426,81 @@ func normalizeIDs(ids interface{}) interface{} {
 }
 
 // ProlongCalc Calculate the renewal
-// @param proxyType - ipv4 | ipv6 | mobile | isp | mix
-// @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
-// for ipv4/isp/mix/mix_isp, ip + ":" + port_http + ":" + port_socks for mobile. For ipv6 the "ip"
-// field already carries the gateway together with the port ("1.2.3.4:26000") while "ip_only" holds
-// the gateway alone, so pass "ip" as it comes, like every other type. ObjectId strings are accepted
-// for every type, and a mixed slice works — each value is routed by shape (splitProlongTargets).
+// @param proxyType - ipv4 | isp | mobile | ipv6 | mix | mix_isp
+// @param ipsOrIds - a slice or a comma-separated string; what identifies a proxy depends on the type.
+// ipv4, isp and mobile are renewed per proxy: pass the address exactly as proxy/list returns it
+// ("1.2.3.4" for ipv4/isp, ip + ":" + port_http + ":" + port_socks for mobile) or the proxy "id"
+// from proxy/list. Addresses go to ips, ids to ipIds. Pass either ids or addresses, not both: a
+// slice that mixes them is refused locally, because with both fields the server renews by ipIds
+// and silently ignores ips.
+// ipv6, mix and mix_isp are renewed only as whole orders: pass the "order_id" from proxy/list or
+// order/list; it goes to orderIds, and every active proxy of that type in those orders is renewed
+// (for mix/mix_isp — the mix packages of those orders). An address sent for these types goes to
+// ips and the server rejects it: "[ips] is not applicable for ipv6: prolong by [orderIds]".
 // @param periodId - ObjectId string OR the period code ("1m"): prolong resolves a non-id value as a
-// code exactly like order/* (ClientApiService.normalizeProlongReferenceCodes)
+// code exactly like order/*
 func ProlongCalc(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	return legacyClient().ProlongCalc(proxyType, ipsOrIds, periodId, coupon)
 }
 
 func (c *Client) ProlongCalc(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	result, err := c.Request(http.MethodPost, "prolong/calc/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ipsOrIds, periodId, coupon))
+	data, err := c.prepareLegacyProlong(proxyType, ipsOrIds, periodId, coupon)
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.Request(http.MethodPost, "prolong/calc/"+url.PathEscape(proxyType), data)
 	return result.Map, err
 }
 
 // ProlongMake Create a renewal order. Attention! Deducts money from the balance.
-// @param proxyType - ipv4 | ipv6 | mobile | isp | mix
-// @param ipsOrIds - the addresses themselves, exactly as proxy/list returns them: "1.2.3.4"
-// for ipv4/isp/mix/mix_isp, ip + ":" + port_http + ":" + port_socks for mobile. For ipv6 the "ip"
-// field already carries the gateway together with the port ("1.2.3.4:26000") while "ip_only" holds
-// the gateway alone, so pass "ip" as it comes, like every other type. ObjectId strings are accepted
-// for every type, and a mixed slice works — each value is routed by shape (splitProlongTargets).
+// @param proxyType - ipv4 | isp | mobile | ipv6 | mix | mix_isp
+// @param ipsOrIds - the same values as in ProlongCalc: the address or the proxy "id" for
+// ipv4/isp/mobile (either ids or addresses, not both), the "order_id" for ipv6/mix/mix_isp,
+// which are renewed as whole orders
 // @param periodId - ObjectId string OR the period code ("1m")
+// @return array Example
+// [
+//
+//	'orderId' => '6a248de4717805635cf6057d',  // the first of orderIds
+//	'orderIds' => ['6a248de4717805635cf6057d', '6a248de4717805635cf6058a'], // every renewed order
+//	'total' => 25.0,
+//	'listBaseOrderNumbers' => ['NS_1790059585687-no', 'NS_1790059601234-kq'], // one per renewed order / mix package
+//	'balance' => 100.5
+//
+// ]
 func ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
 	return legacyClient().ProlongMake(proxyType, ipsOrIds, periodId, coupon)
 }
 
-// Обёртки assertProlongMade здесь больше нет.
+// ProlongMake — см. пакетную ProlongMake: тот же вызов на этом клиенте.
 //
-// Она писалась под прежнюю форму нехватки средств у prolong/make: status="error" с ПУСТЫМ
-// errors[] и calc-данными в data — такую общий разбор конверта отдавал как успех, и
-// несостоявшееся продление выглядело как состоявшееся. Теперь причина лежит в
-// errors[{code:16}] (ProlongMakeResponseClientDto.ofInsufficientFunds — BALANCE_LOW), то есть
-// parseEnvelope и так возвращает *APIError с этим кодом и с данными в APIError.Data.
+// Обёртки assertProlongMade здесь больше нет. Она писалась под прежнюю форму нехватки средств
+// у prolong/make: status="error" с ПУСТЫМ errors[] и calc-данными в data — такую общий разбор
+// конверта отдавал как успех, и несостоявшееся продление выглядело как состоявшееся. Теперь
+// причина лежит в errors[{code:16}], то есть parseEnvelope и так возвращает *APIError с этим
+// кодом и с данными в APIError.Data.
 //
 // Единственным оставшимся эффектом обёртки было превращать ЛЕГИТИМНЫЙ status="success"
 // с пустым orderId в фальшивую ошибку, теряя total/balance/listBaseOrderNumbers уже ПОСЛЕ
-// списания денег. Поэтому она удалена, а не переписана.
+// списания денег. Поэтому она удалена, а не переписана. Список всех продлённых заказов — в
+// orderIds; orderId — его первый элемент.
 func (c *Client) ProlongMake(proxyType string, ipsOrIds interface{}, periodId string, coupon string) (map[string]interface{}, error) {
-	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), c.prepareLegacyProlong(ipsOrIds, periodId, coupon))
+	data, err := c.prepareLegacyProlong(proxyType, ipsOrIds, periodId, coupon)
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.Request(http.MethodPost, "prolong/make/"+url.PathEscape(proxyType), data)
 	return result.Map, err
 }
 
 /////////////////////////////// Typed v2 API ///////////////////////////////
 
-// OrderRequest mirrors the current order/calc and order/make payload.
+// OrderRequest is the order/calc and order/make payload.
 //
 // Every *Id field accepts an ObjectId string OR the matching stable code. When the value is not a
-// known id and the paired *Code field is empty, the server resolves it as a code
-// (ClientApiService.normalizeOrderReferenceCodes). The fallback exists for PaymentID, CountryID,
-// PeriodID, OperatorID, MixID and TarifID, so a code-first request needs no *Code field at all:
+// known id and the paired *Code field is empty, the server resolves it as a code. The fallback
+// exists for PaymentID, CountryID, PeriodID, OperatorID, MixID and TarifID, so a code-first
+// request needs no *Code field at all:
 //
 //	OrderRequest{SectionCode: "mobile", CountryID: "USA", PeriodID: "1m", Quantity: 1,
 //	    OperatorID: "68b1f0c4e13a4c0f1a2b3c4d", RotationID: "5"}
@@ -2480,10 +2524,12 @@ type OrderRequest struct {
 	// code has to come from elsewhere; when in doubt send the id.
 	PeriodCode string `json:"periodCode,omitempty"`
 	Coupon     string `json:"coupon,omitempty"`
-	// PaymentID — ObjectId from balance/payments/list OR a payment code (PaymentSystem.code, or a
-	// PaymentSystemTypes name such as "balance"). Note that balance/add resolves neither — see AddBalance.
+	// PaymentID — the payment system: "balance" (pay from the balance) or "paddle_subscription" (the
+	// saved card, needs an active card subscription), as the code or its ObjectId — the only two
+	// order/make accepts. Required by order/make; order/calc quotes without it. balance/payments/list
+	// does not list these: it is for AddBalance only.
 	PaymentID string `json:"paymentId,omitempty"`
-	// PaymentCode — payment code. balance/payments/list returns only id and name.
+	// PaymentCode — payment code: "balance" or "paddle_subscription".
 	PaymentCode      string `json:"paymentCode,omitempty"`
 	Quantity         int    `json:"quantity,omitempty"`
 	Authorization    string `json:"authorization,omitempty"`
@@ -2497,31 +2543,32 @@ type OrderRequest struct {
 	Protocol string `json:"protocol,omitempty"`
 	// MobileServiceType — shared | dedicated. Required for mobile; prepareOrder defaults it to dedicated.
 	MobileServiceType string `json:"mobileServiceType,omitempty"`
-	// OperatorID — ObjectId OR operator tag (MobileOperator.tag). The id comes from
+	// OperatorID — ObjectId OR operator tag (exact, case-sensitive match). The id comes from
 	// reference/list/mobile → country[].operators.dedicated[].id (or .shared[]).
 	OperatorID string `json:"operatorId,omitempty"`
 	// OperatorCode — operator tag. Not published by reference/list, which returns only id and name.
 	OperatorCode string `json:"operatorCode,omitempty"`
 	// RotationID — rotation interval in MINUTES as a numeric string: "5", "10", "0" = By Link.
 	// Not an id and not a code: the values come from reference/list/mobile →
-	// operators[].rotations[].id, which is the minute count itself. The server does
-	// `requestDto.rotationId as int`, so a non-numeric value like "5m" breaks the request
-	// ("Unknown error", code 35).
+	// operators[].rotations[].id, which is the minute count itself. The server reads it only as
+	// a whole number, so a non-numeric value like "5m" breaks the request ("Unknown error",
+	// code 35).
 	RotationID string `json:"rotationId,omitempty"`
-	// RotationCode — redundant: the server only checks isInteger() and copies the value into
-	// rotationId, with no reference lookup. A non-numeric value is rejected with
+	// RotationCode — redundant: the server only checks that it is an integer and copies the value
+	// into rotationId, with no reference lookup. A non-numeric value is rejected with
 	// "Set existed [rotationCode] from reference". Prefer RotationID.
 	RotationCode string `json:"rotationCode,omitempty"`
 	// TarifID — ObjectId of a resident tariff from reference/list/resident → tarifs[].id, OR the
-	// tariff code (exact match on ResidentTariffPlan.code).
+	// tariff code (exact match).
 	TarifID string `json:"tarifId,omitempty"`
 	// TarifCode — resident tariff code. Not published by reference/list: tarifs[] carries only
 	// id, name and personal.
 	TarifCode    string `json:"tarifCode,omitempty"`
 	GenerateAuth string `json:"generateAuth,omitempty"`
-	// Fingerprint — значение заголовка X-Fingerprint только для этого вызова MakeOrder;
-	// пустое значение берётся с клиента (WithFingerprint / SetFingerprint). В тело запроса
-	// не попадает: это заголовок, а не поле. order/calc заголовок не использует.
+	// Fingerprint — значение необязательного заголовка X-Fingerprint только для этого вызова
+	// MakeOrder; пустое значение берётся с клиента (WithFingerprint / SetFingerprint), а если нет и
+	// его — заголовок не шлётся вовсе, и заказ создаётся без него. В тело запроса не попадает:
+	// это заголовок, а не поле. order/calc заголовок не использует.
 	Fingerprint string `json:"-"`
 }
 
@@ -2534,10 +2581,10 @@ func (c *Client) prepareOrder(order OrderRequest, makeOrder bool) OrderRequest {
 	if order.SectionCode == "mobile" && order.MobileServiceType == "" {
 		order.MobileServiceType = "dedicated"
 	}
-	// Приоритет половин пары повторяет ClientApiService.normalizeOrderReferenceCodes и у
-	// разных пар РАЗНЫЙ. У payment/country/period ветка кода безусловна — код старше id.
-	// У operator/rotation/mix/tarif условие серверное: `if (code && !trimToNull(id))`, то есть
-	// код применяется, ТОЛЬКО когда парный id пуст, — там старше id. Раньше SDK чистил id во
+	// Приоритет половин пары повторяет правило сервера, и у разных пар он РАЗНЫЙ. У
+	// payment/country/period код применяется всегда — код старше id. У
+	// operator/rotation/mix/tarif сервер применяет код, ТОЛЬКО когда парный id пуст, — там
+	// старше id. Раньше SDK чистил id во
 	// всех семи парах, и клиент, заполнивший обе половины, молча получал не тот пакет,
 	// оператора, ротацию или тариф, который выбрал бы сервер.
 	if strings.TrimSpace(order.CountryCode) != "" {
@@ -2596,20 +2643,16 @@ func (c *Client) MakeOrder(order OrderRequest) (map[string]interface{}, error) {
 	if err := requireOrderTarget(order); err != nil {
 		return nil, err
 	}
-	headers, err := c.orderMakeHeaders(order.SectionCode, order.Fingerprint)
-	if err != nil {
-		return nil, err
-	}
-	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.prepareOrder(order, true), headers)
+	result, err := c.RequestWithHeaders(http.MethodPost, "order/make", c.prepareOrder(order, true), c.orderMakeHeaders(order.Fingerprint))
 	return result.Map, err
 }
 
 // OrderListOptions — фильтры order/list. Все опциональные, все уезжают в query.
 //
-// Имена параметров на проводе — snake_case из v1 (OrderController.orderList), а не camelCase
-// proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и переименование
-// заставило бы старую сторону перекладывать параметры. Сервер их не валидирует — неизвестное
-// значение просто не применяется как фильтр, 400 мимо конверта не будет.
+// Имена параметров на проводе — snake_case (order_id, start_date, end_date, status, is_extend,
+// auto_order, page, limit, sort_by, order), а не camelCase, как у proxy/list; поля ответа
+// названы так же. Сервер параметры не валидирует — неизвестное значение просто не применяется
+// как фильтр, 400 мимо конверта не будет.
 type OrderListOptions struct {
 	// OrderID — ObjectId заказа строкой, не число.
 	OrderID string
@@ -2683,8 +2726,8 @@ type ProxyListOptions struct {
 	OrderID string
 	Country string
 	Ends    string
-	// Page и PerPage принимает только маршрут с типом — proxy/list/{type}
-	// (ProxyController.getProxiesByType). На proxy/list без типа они игнорируются.
+	// Page и PerPage принимает только маршрут с типом — proxy/list/{type}. На proxy/list без
+	// типа они игнорируются.
 	Page    int
 	PerPage int
 }
@@ -2738,9 +2781,8 @@ type ProxyDownloadOptions struct {
 	// Country и Ends — фильтры обычных типов; резидентский маршрут их тоже не читает.
 	Country string
 	Ends    string
-	// MaxLine — сколько строк отдать; ТОЛЬКО proxy/download/resident
-	// (ResidentUserController.downloadProxyList принимает его Integer'ом). Прочие типы
-	// параметр игнорируют, поэтому SDK шлёт его только для resident.
+	// MaxLine — сколько строк отдать, целым числом; принимает ТОЛЬКО proxy/download/resident.
+	// Прочие типы параметр игнорируют, поэтому SDK шлёт его только для resident.
 	MaxLine int
 }
 
@@ -2791,23 +2833,41 @@ func (c *Client) SetProxyComment(ids []string, comment string) (map[string]inter
 	return result.Map, err
 }
 
-// ProlongRequest mirrors prolong/calc and prolong/make. normalizeProlongReferenceCodes has the same
-// *Id-or-code fallback as orders, but only for PeriodID and PaymentID — the two reference fields
-// prolong accepts.
+// ProlongRequest is the body of prolong/calc/{type} and prolong/make/{type}, and the selection part
+// of AutoProlongRequest.
+//
+// Which field selects the proxies depends on the type in the path:
+//
+//	ipv4, isp, mobile   renewed per proxy: IPIDs (the "id" field of proxy/list) or IPs (the
+//	                    addresses). If both are set, the server uses IPIDs.
+//	ipv6, mix, mix_isp  renewed only as whole orders: OrderIDs (the "order_id" field of proxy/list
+//	                    or order/list). Every active proxy of that type in those orders is renewed;
+//	                    for mix/mix_isp — the mix packages of those orders.
+//
+// A field of the other kind is rejected with an error that names it, e.g.
+// "[ipIds] is not applicable for ipv6: prolong by [orderIds]" or
+// "[orderIds] is not applicable for ipv4: prolong by [ipIds]". An order that is not yours or has no
+// active proxy of that type — or an empty OrderIDs — fails the whole request with code 29,
+// "Incorrect orderIds", and nothing is renewed.
+//
+// PeriodID and PaymentID take the id or the code with the same fallback as orders: a value that is
+// not a known id is resolved as a code, so PeriodID: "1m" is enough. They are the only two reference
+// fields prolong accepts.
 type ProlongRequest struct {
-	IDs []string `json:"ids,omitempty"`
-	// IPs — сами адреса вместо ObjectId: ipv4/isp/mix/mix_isp — "ip",
-	// mobile — "ip:port_http:port_socks", ipv6 — тоже "ip", в котором уже есть шлюз с портом
-	// ("1.2.3.4:26000"; "ip_only" — только шлюз). Сервер сам резолвит адреса в IDs.
-	// Если заполнены оба поля, сервер берёт IDs.
-	IPs               []string `json:"ips,omitempty"`
-	OrderSeparatorIDs []string `json:"orderSeparatorIds,omitempty"`
-	OrderSeparatorID  string   `json:"orderSeparatorId,omitempty"`
-	Coupon            string   `json:"coupon,omitempty"`
+	// IPIDs — ipv4 / isp / mobile only: proxy ids, the "id" field of proxy/list.
+	IPIDs []string `json:"ipIds,omitempty"`
+	// IPs — ipv4 / isp / mobile only: the addresses themselves, as proxy/list returns them —
+	// ipv4/isp "ip", mobile "ip:port_http:port_socks". Ignored by the server when IPIDs is set.
+	IPs []string `json:"ips,omitempty"`
+	// OrderIDs — ipv6 / mix / mix_isp only: order ids, the "order_id" field of proxy/list or
+	// order/list.
+	OrderIDs []string `json:"orderIds,omitempty"`
+	Coupon   string   `json:"coupon,omitempty"`
 	// PeriodID — ObjectId OR period code ("1m", lowercased by the server).
 	PeriodID   string `json:"periodId,omitempty"`
 	PeriodCode string `json:"periodCode,omitempty"`
-	// PaymentID — ObjectId from balance/payments/list OR a payment code.
+	// PaymentID — "balance" or "paddle_subscription" (the code or its ObjectId), the only two
+	// prolong/* accepts; when neither PaymentID nor PaymentCode is set, the balance is used.
 	PaymentID   string `json:"paymentId,omitempty"`
 	PaymentCode string `json:"paymentCode,omitempty"`
 }
@@ -2839,10 +2899,9 @@ func (c *Client) MakeProlong(proxyType string, request ProlongRequest) (map[stri
 
 /////////////////////////////// Autoprolong ///////////////////////////////
 
-// Платёжки, допустимые для автопродления (AUTO_PROLONG_PAYMENT_TYPES на сервере). Разовый
-// чекаут Paddle сюда не входит: он требует редиректа в браузер, а списание произойдёт без
-// клиента. Всё остальное сервер отбивает текстом
-// "Set [paymentId] from: balance / paddle_subscription".
+// Платёжки, которые сервер принимает для автопродления. Разовый чекаут Paddle сюда не входит:
+// он требует редиректа в браузер, а списание произойдёт без клиента. Всё остальное сервер
+// отбивает текстом "Set [paymentId] from: balance / paddle_subscription".
 const (
 	AutoProlongPaymentBalance            = "balance"
 	AutoProlongPaymentPaddleSubscription = "paddle_subscription"
@@ -2850,10 +2909,17 @@ const (
 
 // AutoProlongRequest — тело autoprolong/calc|enable|disable/{type}.
 //
-// Наследует ProlongRequest ровно как AutoProlongRequestClientDto наследует
-// ProlongRequestClientDto: автопродление адресует те же прокси, что и ручное (IDs, IPs,
-// OrderSeparatorIDs, PeriodID/PeriodCode, PaymentID/PaymentCode), и резолв кодов на сервере
-// общий. Сверху добавлены только SubscriptionID и TarifID.
+// Встраивает ProlongRequest: автопродление выбирает прокси теми же полями и по тем же правилам,
+// что и ручное продление, — ipv4 / isp / mobile по IPIDs либо IPs, ipv6 / mix / mix_isp целыми
+// заказами по OrderIDs (затрагивается каждый активный прокси этого типа в этих заказах), — и так
+// же принимает PeriodID/PeriodCode и PaymentID/PaymentCode (id либо код). Сверху добавлены только
+// SubscriptionID и TarifID.
+//
+// Для type = resident выбора нет вовсе: единица — пакет самого аккаунта. Непустые IPIDs / IPs /
+// OrderIDs там SDK отбивает ещё до запроса (см. assertAutoProlong) — их нельзя ни отправить
+// (сервер ответит "[ipIds] is not applicable for resident: auto-prolong applies to the whole
+// package"), ни молча выбросить: тогда disable, адресованный паре прокси, выключил бы
+// автопродление всего пакета.
 //
 // Сервер принимает и snake-алиасы (payment_id, subscription_id, tarif_id, tariffId) с
 // приоритетом camelCase > snake_case; SDK всегда шлёт каноническое camelCase-написание.
@@ -2875,7 +2941,11 @@ type AutoProlongRequest struct {
 }
 
 // assertAutoProlong повторяет те серверные проверки автопродления, ответ на которые известен
-// заранее: тип, который ручка не обслуживает, и платёжку, без которой списание невозможно.
+// заранее: тип, который ручка не обслуживает, выбор прокси у резидентки и платёжку, без которой
+// списание невозможно.
+//
+// Резидентский пакет продлевается целиком, поэтому любой непустой выбор (IPIDs, IPs, OrderIDs)
+// при type = resident — ошибка для всех трёх вызовов, включая disable.
 //
 // paymentRequired — только для calc и enable: списание произойдёт без клиента, поэтому
 // платёжную систему нельзя угадать (в отличие от prolong/calc, где paymentId необязателен).
@@ -2891,6 +2961,10 @@ type AutoProlongRequest struct {
 func assertAutoProlong(proxyType string, request AutoProlongRequest, paymentRequired bool) error {
 	if strings.EqualFold(strings.TrimSpace(proxyType), "scraper") {
 		return fmt.Errorf("autoprolong: scraper is extended by buying traffic through order/make, the server replies %q", "Create new order to add traffic, prolong options not available")
+	}
+	if normalizeProlongType(proxyType) == "resident" &&
+		(len(request.IPIDs) > 0 || len(request.IPs) > 0 || len(request.OrderIDs) > 0) {
+		return fmt.Errorf("autoprolong: resident auto-prolong applies to the whole package: do not pass proxy or order ids (IPIDs, IPs and OrderIDs must be empty)")
 	}
 	if !paymentRequired {
 		return nil
@@ -2915,7 +2989,7 @@ func (c *Client) prepareAutoProlong(request AutoProlongRequest) AutoProlongReque
 
 // AutoProlongCalc Calculate the upcoming automatic extension charge
 // (POST autoprolong/calc/{type}). Ничего не меняет.
-// @param proxyType - ipv4 | ipv6 | mobile | isp | mix | resident
+// @param proxyType - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
 func AutoProlongCalc(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	return legacyClient().CalculateAutoProlong(proxyType, request)
 }
@@ -2936,8 +3010,10 @@ func AutoProlongCalc(proxyType string, request AutoProlongRequest) (map[string]i
 // заполненным warning и nil-ошибкой.
 //
 // У обычных прокси период обязателен (PeriodID либо PeriodCode), иначе
-// "Set existed [periodId] from reference". Для type = resident тело пакетное: PaymentID и
-// опционально TarifID, без IDs/IPs/PeriodID, а в ответе quantity = 1 и пустой ids.
+// "Set existed [periodId] from reference", а выбор — как у prolong/calc: IPIDs либо IPs для
+// ipv4/isp/mobile, OrderIDs для ipv6/mix/mix_isp. Для type = resident тело пакетное: PaymentID и
+// опционально TarifID, без PeriodID и без выбора (непустые IPIDs/IPs/OrderIDs SDK отбивает до
+// запроса), а в ответе quantity = 1 и пустой items.
 func (c *Client) CalculateAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
 	if err := assertAutoProlong(proxyType, prepared, true); err != nil {
@@ -2955,13 +3031,17 @@ func AutoProlongEnable(proxyType string, request AutoProlongRequest) (map[string
 
 // EnableAutoProlong включает автопродление и привязывает к прокси период и платёжку.
 //
-// Поля ответа: warning, autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
+// Поля ответа: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate,
+// dateEnd. Прежнее поле ids сервер переименовал в ipIds.
 //
-// quantity и ids — это то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 автопродление
-// включается целым заказом, поэтому один адрес включает их все.
+// quantity, ipIds и orderIds — это то, что РЕАЛЬНО затронуто, а не эхо запроса: ipIds — id
+// затронутых прокси (поле id из proxy/list), orderIds — их заказы без повторов. ipv6 / mix /
+// mix_isp включаются целыми заказами (OrderIDs), поэтому quantity и ipIds покрывают все активные
+// прокси присланных заказов.
 //
-// Для type = resident единица правки — пакет: достаточно PaymentID, в ответе quantity = 1 и
-// пустой ids. Этот вызов заменил удалённый resident/autorenew/enable.
+// Для type = resident единица правки — пакет: достаточно PaymentID (выбор прокси SDK отбивает),
+// в ответе quantity = 1 и пустые ipIds и orderIds. Этот вызов заменил удалённый
+// resident/autorenew/enable.
 func (c *Client) EnableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
 	if err := assertAutoProlong(proxyType, prepared, true); err != nil {
@@ -2979,11 +3059,14 @@ func AutoProlongDisable(proxyType string, request AutoProlongRequest) (map[strin
 
 // DisableAutoProlong выключает автопродление и сбрасывает привязанные период и платёжку, так
 // что следующий enable обязан прислать их заново. Ни период, ни платёжка здесь не нужны —
-// только выбор прокси; для type = resident не нужно и его, адресуется пакет самого аккаунта.
-// Этот вызов заменил удалённый resident/autorenew/disable.
+// только выбор прокси, как у enable (IPIDs либо IPs для ipv4/isp/mobile, OrderIDs для
+// ipv6/mix/mix_isp). Для type = resident выбора быть не должно — адресуется пакет самого
+// аккаунта, и непустые IPIDs/IPs/OrderIDs SDK отбивает до запроса, чтобы disable, адресованный
+// паре прокси, не выключил автопродление всего пакета. Этот вызов заменил удалённый
+// resident/autorenew/disable.
 //
-// В ответе days, paymentId и chargeDate — null, а dateEnd остаётся: прокси никуда не делись,
-// они просто перестали продлеваться сами.
+// В ответе те же ipIds[] и orderIds[], что у enable; days, paymentId и chargeDate — null, а
+// dateEnd остаётся: прокси никуда не делись, они просто перестали продлеваться сами.
 func (c *Client) DisableAutoProlong(proxyType string, request AutoProlongRequest) (map[string]interface{}, error) {
 	prepared := c.prepareAutoProlong(request)
 	if err := assertAutoProlong(proxyType, prepared, false); err != nil {
@@ -3019,7 +3102,7 @@ func (c *Client) CreateResidentList(request ResidentListRequest) (map[string]int
 }
 
 // ResidentLists — листы резидентского пакета. data — голый массив, без обёртки items
-// (как в client-api v1). Идентификатор листа числовой: ListItemResponseDto.id — Long.
+// (как в client-api v1). Идентификатор листа числовой — JSON-число (64-битное целое).
 func (c *Client) ResidentLists() ([]interface{}, error) {
 	result, err := c.Request(http.MethodGet, "resident/lists", nil)
 	if err != nil {

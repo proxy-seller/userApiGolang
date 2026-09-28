@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -17,7 +19,12 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.S
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	return NewClient("test-key", WithBaseURL(server.URL+"/personal/api/v2/")), server
+	client := NewClient("test-key", WithBaseURL(server.URL+"/personal/api/v2/"))
+	// Темп запросов остаётся включённым, но идёт по фейковым часам (ratelimit_test.go): эти тесты
+	// проверяют форму запросов, а серия write/money-вызовов на одном клиенте иначе ждала бы
+	// реальные секунды.
+	useFakeClock(client, newFakeClock())
+	return client, server
 }
 
 func envelopeHandler(t *testing.T, body string, captured *string) http.HandlerFunc {
@@ -38,11 +45,10 @@ func envelopeHandler(t *testing.T, body string, captured *string) http.HandlerFu
 
 // Проверка локального гейта цели заказа.
 //
-// Бэкенд (ClientApiService.parseMixSelection) резолвит mix не только по mixId/mixCode,
-// но и через countryId: строкой "packageId:quantity" либо countryId=packageId вместе с
-// quantity. Если mix распознан, requiresClientApiGoal возвращает false и customTargetName
-// не нужен. Тест фиксирует именно это, потому что раньше гейт проверял только mixId/mixCode
-// и блокировал legacy-путь OrderCalcMix/OrderMakeMix (пакет уезжает в countryId).
+// Сервер распознаёт mix не только по mixId/mixCode, но и через countryId: строкой
+// "packageId:quantity" либо countryId=packageId вместе с quantity. Если mix распознан,
+// customTargetName не нужен. Тест фиксирует именно это, потому что раньше гейт проверял только
+// mixId/mixCode и блокировал legacy-путь OrderCalcMix/OrderMakeMix (пакет тогда уезжал в countryId).
 func TestRequireCustomTargetNameMixViaCountryId(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -152,9 +158,8 @@ func TestDeleteResultMap(t *testing.T) {
 	}
 }
 
-// errors[].code на бэкенде — int (ProxySellerApiErrorItemDto.code / ClientApiErrorsDto.code /
-// ApiErrorDto.code). Пока поле лежало в interface{}, encoding/json давал float64 и любое
-// ветвление по коду было тихо ложным. Тест фиксирует типизацию.
+// errors[].code на проводе — целое JSON-число. Пока поле лежало в interface{}, encoding/json
+// давал float64 и любое ветвление по коду было тихо ложным. Тест фиксирует типизацию.
 func TestAPIErrorCodeIsTyped(t *testing.T) {
 	body := `{"status":"error","data":null,"errors":[{"message":"Set comment","code":503}]}`
 	_, err := parseEnvelope([]byte(body), http.StatusOK)
@@ -194,7 +199,7 @@ func TestAPIErrorCodeIsTyped(t *testing.T) {
 }
 
 // Ошибки доступа (битый ключ / IP не разрешён / rate limit) приходят HTTP 200 одной и той же
-// тройкой (LegacyClientApiErrorHelper.legacyAccessErrors). Клиент обязан видеть весь массив.
+// тройкой ошибок с code 503. Клиент обязан видеть весь массив.
 func TestAccessErrorTripleIsFullyVisible(t *testing.T) {
 	body := `{"status":"error","data":null,"errors":[` +
 		`{"message":"Error api key","code":503},` +
@@ -222,7 +227,7 @@ func TestAccessErrorTripleIsFullyVisible(t *testing.T) {
 }
 
 // ext: длина <= 250, запрещены CR, LF, '/' и '\' — иначе сервер отвечает голым HTTP 400
-// плайн-текстом мимо конверта (ResidentUserApiService.downloadProxyList).
+// плайн-текстом мимо конверта.
 func TestAssertExt(t *testing.T) {
 	if err := assertExt(""); err != nil {
 		t.Fatalf("пустой ext допустим, получено: %v", err)
@@ -334,7 +339,7 @@ func TestClientHasMethodsForLegacyPackageFunctions(t *testing.T) {
 	}
 }
 
-// proxy/replace: type — ПРИЧИНА замены (enum ProxyReplaceType), а не тип прокси;
+// proxy/replace: type — ПРИЧИНА замены (одна из ProxyReplaceReasons), а не тип прокси;
 // при CUSTOM обязателен непустой comment (иначе сервер отвечает "Set comment", code 503).
 func TestProxyReplaceReasonValidation(t *testing.T) {
 	if err := assertProxyReplaceReason("ipv4", ""); err == nil {
@@ -349,7 +354,7 @@ func TestProxyReplaceReasonValidation(t *testing.T) {
 			t.Fatalf("причина %s должна проходить: %v", reason, err)
 		}
 	}
-	// сервер делает value.toUpperCase() — регистр не важен
+	// сервер принимает причину в любом регистре
 	if err := assertProxyReplaceReason("not_work", ""); err != nil {
 		t.Fatalf("нижний регистр допустим: %v", err)
 	}
@@ -362,8 +367,8 @@ func TestProxyReplaceReasonValidation(t *testing.T) {
 	}
 }
 
-// balance/add — единственная точка, где paymentCode НЕ резолвится (normalizeOrderReferenceCodes
-// там не вызывается). Раньше SDK молча уезжал с paymentId="".
+// balance/add — единственная точка, где paymentCode НЕ резолвится: сервер принимает там только
+// paymentId. Раньше SDK молча уезжал с paymentId="".
 func TestAddBalanceRejectsPaymentCodeOnly(t *testing.T) {
 	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"url":"https://pay"},"errors":[]}`, nil))
 	client.SetPaymentCode("balance")
@@ -443,8 +448,7 @@ func TestAutoTopupGetParsesState(t *testing.T) {
 	}
 }
 
-// Границы значений приходят в errors[0].customData (ClientApiService.setAutoTopup),
-// коды 49-53 и 56 (54 и 55 удалены вместе с дневным и месячным лимитами). Клиент обязан
+// Границы значений приходят в errors[0].customData, коды 49-53 и 56 (54 и 55 удалены вместе с дневным и месячным лимитами). Клиент обязан
 // иметь к ним доступ.
 func TestAutoTopupLimitsFromError(t *testing.T) {
 	body := `{"status":"error","data":null,"errors":[{"message":"Top-up amount must be 5 or more","code":51,` +
@@ -455,7 +459,7 @@ func TestAutoTopupLimitsFromError(t *testing.T) {
 		t.Fatalf("ожидался *APIError, получено %T", err)
 	}
 	if !apiErr.HasCode(51) {
-		t.Fatal("код 51 (AUTO_TOPUP_MIN_AMOUNT) должен быть доступен")
+		t.Fatal("код 51 (сумма ниже минимума) должен быть доступен")
 	}
 	limits, found := AutoTopupLimitsFromError(err)
 	if !found {
@@ -477,8 +481,8 @@ func TestAutoTopupLimitsFromError(t *testing.T) {
 	}
 }
 
-// Типы listId — по серверным DTO: resident/list/* принимает Long, а
-// residentsubuser/list/delete — String (@NotBlank).
+// Типы listId — как на проводе: resident/list/* принимает JSON-число, а
+// residentsubuser/list/delete — непустую строку.
 func TestListIDTypesMatchServer(t *testing.T) {
 	var body string
 	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":"delete","errors":[]}`, &body))
@@ -509,7 +513,7 @@ func TestListIDTypesMatchServer(t *testing.T) {
 	}
 }
 
-// ids во всех DTO — Set<String> с ObjectId; ветки []int больше нет, значения не-string
+// Списки id в запросах — строки ObjectId; ветки []int больше нет, значения не-string
 // уходят как есть, а не превращаются в бессмысленные строковые id.
 func TestNormalizeIDs(t *testing.T) {
 	got, ok := normalizeIDs("a, b ,,c").([]string)
@@ -525,8 +529,7 @@ func TestNormalizeIDs(t *testing.T) {
 	}
 }
 
-// prolong/make при нехватке средств кладёт причину в errors[{code:16}]
-// (ProlongMakeResponseClientDto.ofInsufficientFunds — BALANCE_LOW), поэтому её разбирает
+// prolong/make при нехватке средств кладёт причину в errors[{code:16}], поэтому её разбирает
 // общий parseEnvelope, и отдельной обёртки в SDK больше нет.
 //
 // Прежняя форма — status="error" с ПУСТЫМ errors[] — под которую эта обёртка писалась,
@@ -545,28 +548,34 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 		t.Fatalf("ожидался *APIError, получено %T", err)
 	}
 	if !apiErr.HasCode(16) {
-		t.Fatalf("код 16 (BALANCE_LOW) должен быть доступен, получено: %v", err)
+		t.Fatalf("код 16 (нехватка средств) должен быть доступен, получено: %v", err)
 	}
 
 	// типизированный путь ведёт себя так же
 	client2, _ := newTestClient(t, envelopeHandler(t, insufficient, nil))
-	if _, err = client2.MakeProlong("ipv4", ProlongRequest{IDs: []string{"x"}, PeriodID: "1m"}); err == nil {
+	if _, err = client2.MakeProlong("ipv4", ProlongRequest{IPIDs: []string{"x"}, PeriodID: "1m"}); err == nil {
 		t.Fatal("MakeProlong тоже обязан вернуть ошибку при нехватке средств")
 	}
 
-	// успешное продление по-прежнему проходит
-	okBody := `{"status":"success","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d","total":10,"balance":90,"listBaseOrderNumbers":[]},"errors":[]}`
+	// Успешное продление по-прежнему проходит. orderIds — все продлённые заказы (одним запросом
+	// их может быть несколько), orderId — первый из них.
+	okBody := `{"status":"success","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d",` +
+		`"orderIds":["68b1f0c4e13a4c0f1a2b3c4d","68b1f0c4e13a4c0f1a2b3c4e"],"total":10,"balance":90,` +
+		`"listBaseOrderNumbers":["LH-1","LH-2"]},"errors":[]}`
 	client3, _ := newTestClient(t, envelopeHandler(t, okBody, nil))
-	data, err := client3.ProlongMake("ipv4", []string{"x"}, "1m", "")
+	data, err := client3.ProlongMake("ipv6", []string{"68b1f0c4e13a4c0f1a2b3c4d", "68b1f0c4e13a4c0f1a2b3c4e"}, "1m", "")
 	if err != nil {
 		t.Fatalf("успешное продление не должно давать ошибку: %v", err)
 	}
 	if data["orderId"] != "68b1f0c4e13a4c0f1a2b3c4d" {
 		t.Fatalf("orderId потерян: %#v", data)
 	}
+	if orderIDs, _ := data["orderIds"].([]interface{}); len(orderIDs) != 2 || orderIDs[1] != "68b1f0c4e13a4c0f1a2b3c4e" {
+		t.Fatalf("orderIds потерян: %#v", data["orderIds"])
+	}
 
 	// Деньги уже списаны: пустой orderId в успешном конверте терять total/balance нельзя.
-	emptyID := `{"status":"success","data":{"orderId":"","total":10,"balance":90,"listBaseOrderNumbers":["LH-1"]},"errors":[]}`
+	emptyID := `{"status":"success","data":{"orderId":"","orderIds":[],"total":10,"balance":90,"listBaseOrderNumbers":["LH-1"]},"errors":[]}`
 	client4, _ := newTestClient(t, envelopeHandler(t, emptyID, nil))
 	data, err = client4.ProlongMake("ipv4", []string{"x"}, "1m", "")
 	if err != nil {
@@ -577,8 +586,9 @@ func TestProlongMakeInsufficientFundsIsAnError(t *testing.T) {
 	}
 }
 
-// TestSplitProlongTargets — клиент продлевает по адресам, которые видит в proxy/list, а не по
-// ObjectId. Каждое значение маршрутизируется по форме, так что смешанный список тоже работает.
+// TestSplitProlongTargets — значения разводятся по форме: строка с "." или ":" — адрес, всё
+// остальное — id; смешанный список разводится на обе части. В какое поле уйдут id (ipIds или
+// orderIds) и допустим ли смешанный список, решает тип — см. TestPrepareLegacyProlongRoutesByType.
 func TestSplitProlongTargets(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -587,14 +597,16 @@ func TestSplitProlongTargets(t *testing.T) {
 		wantIDs []string
 	}{
 		{"ipv4", []string{"1.2.3.4", "5.6.7.8"}, []string{"1.2.3.4", "5.6.7.8"}, nil},
-		// Любая строка с двоеточием уходит в ips — и адрес ipv6 (в поле "ip" уже шлюз с портом,
-		// "1.2.3.4:26000"), и mobile-тройка.
+		// Любая строка с двоеточием — адрес: и mobile-тройка ip:port_http:port_socks, и литерал ipv6.
 		{"colon address", []string{"2001:db8::1:8080"}, []string{"2001:db8::1:8080"}, nil},
 		{"mobile triple", []string{"10.0.0.1:8000:9000"}, []string{"10.0.0.1:8000:9000"}, nil},
 		{"objectids", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, nil, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
 		{"mixed", []string{"1.2.3.4", "68b1f0c4e13a4c0f1a2b3c4d"}, []string{"1.2.3.4"}, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
 		{"comma string", "1.2.3.4, 5.6.7.8", []string{"1.2.3.4", "5.6.7.8"}, nil},
 		{"blanks dropped", []string{"1.2.3.4", "   ", ""}, []string{"1.2.3.4"}, nil},
+		{"interface slice, non-strings skipped", []interface{}{"1.2.3.4", "68b1f0c4e13a4c0f1a2b3c4d", 5},
+			[]string{"1.2.3.4"}, []string{"68b1f0c4e13a4c0f1a2b3c4d"}},
+		{"nil", nil, nil, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -609,22 +621,197 @@ func TestSplitProlongTargets(t *testing.T) {
 	}
 }
 
-// TestPrepareLegacyProlongSendsIPs — адреса уезжают в ips, а поле ids при этом не появляется
-// пустым: сервер отдаёт приоритет ids, и пустой список молча отменил бы продление по адресам.
-func TestPrepareLegacyProlongSendsIPs(t *testing.T) {
-	c := NewClient("test-key")
-	data := c.prepareLegacyProlong([]string{"1.2.3.4"}, "1m", "")
-	if _, present := data["ids"]; present {
-		t.Fatalf("ids must be absent when prolonging by address, got %#v", data)
+// TestPrepareLegacyProlongRoutesByType — позиционные ProlongCalc/ProlongMake раскладывают выбор
+// по типу. ipv4 / isp / mobile продлеваются по отдельным прокси: id уходит в ipIds, адрес — в ips,
+// а список, где смешаны id и адреса, отбивается ошибкой (см. TestProlongRefusesMixedIDsAndAddresses).
+// ipv6 / mix / mix_isp продлеваются только целым заказом: id уходит в orderIds, адрес — в ips, и
+// смешанный список уходит как есть (часть ips сервер отбивает сам). resident выбора не шлёт вовсе.
+// Поля ids сервер больше не принимает — его не должно быть ни в одной ветке, включая сырой фолбэк
+// для значения, которое не разобралось.
+func TestPrepareLegacyProlongRoutesByType(t *testing.T) {
+	const (
+		proxyID  = "68b1f0c4e13a4c0f1a2b3c4d"
+		orderID  = "6a248de4717805635cf6057d"
+		orderID2 = "6a248de4717805635cf6058a"
+	)
+	cases := []struct {
+		name      string
+		proxyType string
+		input     interface{}
+		want      map[string]interface{} // только поля выбора: ids / ips / ipIds / orderIds
+	}{
+		{"ipv4 address", "ipv4", []string{"1.2.3.4"}, map[string]interface{}{"ips": []string{"1.2.3.4"}}},
+		{"ipv4 id", "ipv4", []string{proxyID}, map[string]interface{}{"ipIds": []string{proxyID}}},
+		{"isp id from a string", "isp", proxyID, map[string]interface{}{"ipIds": []string{proxyID}}},
+		{"mobile address", "mobile", []string{"10.0.0.1:50100:50101"}, map[string]interface{}{"ips": []string{"10.0.0.1:50100:50101"}}},
+		{"ipv6 order id", "ipv6", []string{orderID}, map[string]interface{}{"orderIds": []string{orderID}}},
+		{"mix order ids from a comma string", "mix", orderID + ", " + orderID2,
+			map[string]interface{}{"orderIds": []string{orderID, orderID2}}},
+		{"mix_isp order id", "mix_isp", []string{orderID}, map[string]interface{}{"orderIds": []string{orderID}}},
+		{"type is normalized", " Mix-ISP ", []string{orderID}, map[string]interface{}{"orderIds": []string{orderID}}},
+		// Адрес для заказного типа не превращается в заказ: он уходит в ips, и сервер называет
+		// причину отказа ("[ips] is not applicable for ipv6: prolong by [orderIds]").
+		{"ipv6 address stays in ips", "ipv6", []string{"1.2.3.4:26000"}, map[string]interface{}{"ips": []string{"1.2.3.4:26000"}}},
+		{"ipv6 mixed list keeps both parts", "ipv6", []string{orderID, "1.2.3.4:26000"},
+			map[string]interface{}{"orderIds": []string{orderID}, "ips": []string{"1.2.3.4:26000"}}},
+		{"mix mixed list keeps both parts", "mix", []string{"1.2.3.4", orderID},
+			map[string]interface{}{"orderIds": []string{orderID}, "ips": []string{"1.2.3.4"}}},
+		{"resident sends no selection", "resident", []string{proxyID}, map[string]interface{}{}},
+		{"raw fallback goes to ipIds", "ipv4", []int{1, 2}, map[string]interface{}{"ipIds": []int{1, 2}}},
+		{"raw fallback goes to orderIds", "mix", []int{1}, map[string]interface{}{"orderIds": []int{1}}},
+		{"nil sends no selection", "ipv4", nil, map[string]interface{}{}},
 	}
-	ips, ok := data["ips"].([]string)
-	if !ok || len(ips) != 1 || ips[0] != "1.2.3.4" {
-		t.Fatalf("ips = %#v, want [1.2.3.4]", data["ips"])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := NewClient("test-key").prepareLegacyProlong(tc.proxyType, tc.input, "1m", "")
+			if err != nil {
+				t.Fatalf("неожиданная ошибка: %v", err)
+			}
+			got := map[string]interface{}{}
+			for _, field := range []string{"ids", "ips", "ipIds", "orderIds"} {
+				if value, present := data[field]; present {
+					got[field] = value
+				}
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("selection = %#v, want %#v (whole body: %#v)", got, tc.want, data)
+			}
+			if data["periodId"] != "1m" {
+				t.Fatalf("periodId потерян: %#v", data)
+			}
+		})
 	}
 }
 
-// TestOrderMixSendsMixId — идентификатор MIX-пакета должен уходить в mixId: parseMixSelection
-// ищет пакет через findById(mixId), а countryId для него — не то поле.
+// ipv4 / isp / mobile: список, где смешаны id прокси и адреса, отбивается до запроса — получив оба
+// поля, сервер продлевает по ipIds и молча игнорирует ips, и адреса выпали бы из оплаченного
+// продления. Ни calc, ни make с таким списком на сервер не уходят.
+func TestProlongRefusesMixedIDsAndAddresses(t *testing.T) {
+	var requests int32
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"total":1},"errors":[]}`))
+	})
+	mixed := map[string][]string{
+		"ipv4":   {"1.2.3.4", "68b1f0c4e13a4c0f1a2b3c4d"},
+		"isp":    {"68b1f0c4e13a4c0f1a2b3c4d", "5.6.7.8"},
+		"mobile": {"10.0.0.1:50100:50101", "68b1f0c4e13a4c0f1a2b3c4d"},
+	}
+	for proxyType, list := range mixed {
+		if _, err := client.ProlongCalc(proxyType, list, "1m", ""); err == nil ||
+			!strings.Contains(err.Error(), "mixing proxy ids and addresses") {
+			t.Fatalf("ProlongCalc(%s, смешанный список): ожидалась локальная ошибка, получено %v", proxyType, err)
+		}
+		if _, err := client.ProlongMake(proxyType, strings.Join(list, ","), "1m", ""); err == nil ||
+			!strings.Contains(err.Error(), "mixing proxy ids and addresses") {
+			t.Fatalf("ProlongMake(%s, смешанная строка): ожидалась локальная ошибка, получено %v", proxyType, err)
+		}
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("смешанный список не должен уходить на сервер, ушло запросов: %d", got)
+	}
+
+	// Однородные списки уходят как раньше.
+	if _, err := client.ProlongCalc("ipv4", []string{"1.2.3.4", "5.6.7.8"}, "1m", ""); err != nil {
+		t.Fatalf("ProlongCalc по адресам: %v", err)
+	}
+	if _, err := client.ProlongCalc("ipv4", []string{"68b1f0c4e13a4c0f1a2b3c4d"}, "1m", ""); err != nil {
+		t.Fatalf("ProlongCalc по id: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Fatalf("ожидалось 2 запроса с однородными списками, ушло %d", got)
+	}
+}
+
+// Резидентский пакет продлевается целиком: любой непустой выбор (IPIDs, IPs, OrderIDs) при
+// type = resident отбивается до запроса — для calc, enable и disable. Его нельзя ни отправить, ни
+// молча выбросить: тогда disable, адресованный паре прокси, выключил бы автопродление всего пакета.
+func TestAutoProlongResidentRefusesSelection(t *testing.T) {
+	var requests int32
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"autoProlong":false,"quantity":1,"ipIds":[],"orderIds":[]},"errors":[]}`))
+	})
+	selections := map[string]ProlongRequest{
+		"IPIDs":    {IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PaymentID: "balance"},
+		"IPs":      {IPs: []string{"1.2.3.4"}, PaymentID: "balance"},
+		"OrderIDs": {OrderIDs: []string{"6a248de4717805635cf6057d"}, PaymentID: "balance"},
+	}
+	calls := map[string]func(string, AutoProlongRequest) (map[string]interface{}, error){
+		"calc":    client.CalculateAutoProlong,
+		"enable":  client.EnableAutoProlong,
+		"disable": client.DisableAutoProlong,
+	}
+	for field, selection := range selections {
+		for name, call := range calls {
+			for _, proxyType := range []string{"resident", " Resident "} {
+				_, err := call(proxyType, AutoProlongRequest{ProlongRequest: selection})
+				if err == nil || !strings.Contains(err.Error(), "applies to the whole package") {
+					t.Fatalf("%s(%q) с %s: ожидалась локальная ошибка, получено %v", name, proxyType, field, err)
+				}
+			}
+		}
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("выбор для resident не должен уходить на сервер, ушло запросов: %d", got)
+	}
+
+	// Без выбора резидентские вызовы уходят как раньше, а у обычных типов выбор, конечно, законен.
+	if _, err := client.EnableAutoProlong("resident", AutoProlongRequest{ProlongRequest: ProlongRequest{PaymentID: "balance"}}); err != nil {
+		t.Fatalf("EnableAutoProlong(resident) без выбора: %v", err)
+	}
+	if _, err := client.DisableAutoProlong("resident", AutoProlongRequest{}); err != nil {
+		t.Fatalf("DisableAutoProlong(resident) без выбора: %v", err)
+	}
+	if _, err := client.DisableAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}}}); err != nil {
+		t.Fatalf("DisableAutoProlong(ipv4) с IPIDs: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 3 {
+		t.Fatalf("ожидалось 3 запроса, ушло %d", got)
+	}
+}
+
+// Тот же выбор на проводе: тело prolong/calc/ipv6 несёт orderIds, а не ids и не ipIds.
+func TestProlongCalcSendsOrderIDsForOrderTypes(t *testing.T) {
+	var body string
+	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"total":1},"errors":[]}`, &body))
+	if _, err := client.ProlongCalc("ipv6", []string{"6a248de4717805635cf6057d"}, "1m", ""); err != nil {
+		t.Fatalf("ProlongCalc: %v", err)
+	}
+	if want := `{"coupon":"","orderIds":["6a248de4717805635cf6057d"],"periodId":"1m"}`; body != want {
+		t.Fatalf("тело = %s, ожидалось %s", body, want)
+	}
+}
+
+// Поля ProlongRequest уходят под именами контракта: ipIds, ips, orderIds. Прежних ids,
+// orderSeparatorIds и orderSeparatorId в теле нет; AutoProlongRequest встраивает те же поля.
+func TestProlongRequestWireNames(t *testing.T) {
+	encoded, err := json.Marshal(ProlongRequest{
+		IPIDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, IPs: []string{"1.2.3.4"},
+		OrderIDs: []string{"6a248de4717805635cf6057d"}, PeriodID: "1m",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `{"ipIds":["68b1f0c4e13a4c0f1a2b3c4d"],"ips":["1.2.3.4"],"orderIds":["6a248de4717805635cf6057d"],"periodId":"1m"}`; string(encoded) != want {
+		t.Fatalf("ProlongRequest = %s, ожидалось %s", encoded, want)
+	}
+
+	encoded, err = json.Marshal(AutoProlongRequest{
+		ProlongRequest: ProlongRequest{OrderIDs: []string{"6a248de4717805635cf6057d"}, PaymentID: "balance"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `{"orderIds":["6a248de4717805635cf6057d"],"paymentId":"balance"}`; string(encoded) != want {
+		t.Fatalf("AutoProlongRequest = %s, ожидалось %s", encoded, want)
+	}
+}
+
+// TestOrderMixSendsMixId — идентификатор MIX-пакета должен уходить в mixId: сервер ищет пакет по
+// mixId, а countryId для него — не то поле.
 func TestOrderMixSendsMixId(t *testing.T) {
 	c := NewClient("test-key")
 	data := c.prepareMix("mix", "europe-2-mix_IPv4", "1m", 10, "", "", "")
@@ -667,10 +854,81 @@ func TestGenerateAuthPrecedence(t *testing.T) {
 	}
 }
 
-// Имена фильтров order/list — snake_case из v1 (OrderController.orderList), а не camelCase
-// proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и переименование
-// сломало бы их молча — запрос бы ушёл, фильтр бы не применился.
-func TestOrderListSendsV1FilterNames(t *testing.T) {
+// X-Fingerprint необязателен: без отпечатка резидентский и скраперный order/make уходят на сервер
+// (без заголовка вовсе, а не с пустым), и SDK никогда не отбивает заказ из-за его отсутствия.
+// Заданный отпечаток уходит на любую секцию, значение на вызов (OrderRequest.Fingerprint) старше
+// клиентского, а order/calc заголовок не несёт.
+func TestOrderMakeFingerprintIsOptional(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string // "order/make <значение>" по запросам; <none> — заголовка не было
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		value := "<none>"
+		if values := r.Header.Values(FingerprintHeader); len(values) > 0 {
+			value = strings.Join(values, ",")
+		}
+		mu.Lock()
+		seen = append(seen, r.URL.Path[strings.LastIndex(r.URL.Path, "/order/")+1:]+" "+value)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d","total":1,"balance":9},"errors":[]}`))
+	})
+	last := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(seen) == 0 {
+			return ""
+		}
+		return seen[len(seen)-1]
+	}
+
+	if _, err := client.OrderMakeResident("1-gb", ""); err != nil {
+		t.Fatalf("OrderMakeResident без отпечатка не должен падать локально: %v", err)
+	}
+	if got := last(); got != "order/make <none>" {
+		t.Fatalf("резидентский заказ без отпечатка: %q, ожидалось order/make без заголовка", got)
+	}
+	if _, err := client.MakeOrder(OrderRequest{SectionCode: "scraper", TarifID: "basic"}); err != nil {
+		t.Fatalf("MakeOrder(scraper) без отпечатка не должен падать локально: %v", err)
+	}
+	if got := last(); got != "order/make <none>" {
+		t.Fatalf("скраперный заказ без отпечатка: %q, ожидалось order/make без заголовка", got)
+	}
+
+	// Пробелы — это не значение: заголовок по-прежнему не уходит.
+	client.SetFingerprint("   ")
+	if _, err := client.OrderMakeResident("1-gb", ""); err != nil {
+		t.Fatalf("OrderMakeResident с пустым отпечатком: %v", err)
+	}
+	if got := last(); got != "order/make <none>" {
+		t.Fatalf("пустой отпечаток: %q, заголовок уходить не должен", got)
+	}
+
+	client.SetFingerprint("install-1")
+	if _, err := client.OrderMakeIpv4("USA", "1m", 1, "", "", "seo"); err != nil {
+		t.Fatalf("OrderMakeIpv4: %v", err)
+	}
+	if got := last(); got != "order/make install-1" {
+		t.Fatalf("отпечаток клиента: %q, ожидалось order/make install-1", got)
+	}
+	if _, err := client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", Fingerprint: "per-call"}); err != nil {
+		t.Fatalf("MakeOrder(resident): %v", err)
+	}
+	if got := last(); got != "order/make per-call" {
+		t.Fatalf("значение на вызов: %q, ожидалось order/make per-call", got)
+	}
+
+	if _, err := client.CalculateOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb"}); err != nil {
+		t.Fatalf("CalculateOrder: %v", err)
+	}
+	if got := last(); got != "order/calc <none>" {
+		t.Fatalf("order/calc: %q, заголовок уходить не должен", got)
+	}
+}
+
+// Имена фильтров order/list — snake_case (order_id, start_date, is_extend, sort_by, …), а не
+// camelCase, как у proxy/list. Переименование сломало бы запрос молча: он бы ушёл, а фильтр бы
+// не применился.
+func TestOrderListSendsSnakeCaseFilterNames(t *testing.T) {
 	var captured string
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		captured = r.URL.RequestURI()
