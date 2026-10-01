@@ -2,11 +2,16 @@ package userApiGolang
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +24,22 @@ const DefaultBaseURL = "https://proxy-seller.com/personal/api/v2/"
 // (components.parameters.Fingerprint). См. WithFingerprint.
 const FingerprintHeader = "X-Fingerprint"
 
-// URL is kept for source compatibility. New code should use WithBaseURL.
+const (
+	// defaultTimeout — таймаут запроса по умолчанию, см. WithTimeout.
+	defaultTimeout = 30 * time.Second
+	// defaultMoneyTimeout — таймаут денежного запроса по умолчанию, см. WithMoneyTimeout.
+	defaultMoneyTimeout = 120 * time.Second
+	// moneyTimeoutOff — значение Client.moneyTimeout после WithMoneyTimeout(0): отдельного таймаута
+	// у денежных запросов нет, они ждут столько же, сколько любой другой.
+	moneyTimeoutOff time.Duration = -1
+)
+
+// URL is kept for source compatibility. While it differs from DefaultBaseURL, it overrides the
+// base URL of DefaultClient for the package-level functions; at its default value it leaves
+// DefaultClient alone, so a DefaultClient made with WithBaseURL keeps its own base URL.
+//
+// Deprecated: the package-level API keeps one state for the whole process. Use
+// NewClient(key, WithBaseURL(...)) instead.
 var URL = DefaultBaseURL
 
 // Client is safe for concurrent use. Its requests are paced by default — see WithRateLimit and the
@@ -34,7 +54,16 @@ type Client struct {
 	generateAuth string
 	fingerprint  string
 	httpClient   *http.Client
+	// moneyTimeout — таймаут денежных запросов, см. WithMoneyTimeout: 0 — значение по умолчанию
+	// (defaultMoneyTimeout, так ведёт себя и Client, созданный не через NewClient), moneyTimeoutOff —
+	// отдельного таймаута нет.
+	moneyTimeout time.Duration
 	limiter      *rateLimiter // pacing of every request, see ratelimit.go
+	// urlOverridden — базовый URL сейчас подменён пакетной переменной URL (см. legacyClient), а
+	// ownBaseURL — собственный адрес клиента до подмены: он вернётся, когда URL вернут к
+	// DefaultBaseURL.
+	urlOverridden bool
+	ownBaseURL    string
 }
 
 type ClientOption func(*Client)
@@ -56,6 +85,9 @@ func WithFingerprint(fingerprint string) ClientOption {
 	return func(c *Client) { c.fingerprint = strings.TrimSpace(fingerprint) }
 }
 
+// WithHTTPClient sends every request through the given *http.Client (custom transport, TLS, tracing,
+// local stubs). The SDK never modifies it: a money request goes through a copy of it with a longer
+// Timeout and the same Transport, Jar and CheckRedirect — see WithMoneyTimeout.
 func WithHTTPClient(httpClient *http.Client) ClientOption {
 	return func(c *Client) {
 		if httpClient != nil {
@@ -64,6 +96,8 @@ func WithHTTPClient(httpClient *http.Client) ClientOption {
 	}
 }
 
+// WithTimeout sets the timeout of a request. Default 30 s; a value of 0 or less is ignored. Money
+// requests wait for the longer of this and WithMoneyTimeout (120 s by default).
 func WithTimeout(timeout time.Duration) ClientOption {
 	return func(c *Client) {
 		if timeout > 0 {
@@ -77,12 +111,64 @@ func WithTimeout(timeout time.Duration) ClientOption {
 	}
 }
 
+// WithMoneyTimeout sets the timeout of money requests — order/make, prolong/make/{type} and
+// balance/add. Default 120 s, while every other request keeps WithTimeout (30 s): a large order is
+// processed synchronously, and a money request cut short by the client is still an order that was
+// created and paid. A money request waits for the longer of the two, so a longer WithTimeout is never
+// shortened. 0 (or a negative value) turns the separate timeout off: money requests then use the
+// client timeout like every other request.
+//
+// The *http.Client given to WithHTTPClient is not modified: a money request goes through a copy of
+// it with the longer Timeout and the same Transport, Jar and CheckRedirect. The timeouts of the
+// Transport itself (ResponseHeaderTimeout and the like) still apply, and a client without a timeout
+// (Timeout 0) stays without one. See the README section "Timeouts and retries on payments".
+func WithMoneyTimeout(timeout time.Duration) ClientOption {
+	return func(c *Client) {
+		if timeout <= 0 {
+			timeout = moneyTimeoutOff
+		}
+		c.moneyTimeout = timeout
+	}
+}
+
 func NewClient(apiKey string, options ...ClientOption) *Client {
-	c := &Client{baseURL: DefaultBaseURL, apiKey: apiKey, generateAuth: "N", httpClient: &http.Client{Timeout: 30 * time.Second}, limiter: newRateLimiter()}
+	c := &Client{baseURL: DefaultBaseURL, apiKey: apiKey, generateAuth: "N", httpClient: &http.Client{Timeout: defaultTimeout}, moneyTimeout: defaultMoneyTimeout, limiter: newRateLimiter()}
 	for _, option := range options {
 		option(c)
 	}
 	return c
+}
+
+// String and GoString print the client without its API key ("***"): without them fmt would print
+// the unexported fields, the key among them, for %v, %+v and %#v.
+func (c *Client) String() string {
+	if c == nil {
+		return "<nil>"
+	}
+	baseURL, key := c.printable()
+	return fmt.Sprintf("userApiGolang.Client{baseURL: %q, apiKey: %q}", baseURL, key)
+}
+
+func (c *Client) GoString() string {
+	if c == nil {
+		return "(*userApiGolang.Client)(nil)"
+	}
+	baseURL, key := c.printable()
+	return fmt.Sprintf("&userApiGolang.Client{baseURL:%q, apiKey:%q}", baseURL, key)
+}
+
+// printable — базовый URL (без пароля, если он в нём есть) и ключ, заменённый на "***".
+func (c *Client) printable() (string, string) {
+	c.mu.RLock()
+	baseURL, key := normalizeBaseURL(c.baseURL), c.apiKey
+	c.mu.RUnlock()
+	if parsed, err := url.Parse(baseURL); err == nil {
+		baseURL = parsed.Redacted()
+	}
+	if key != "" {
+		key = redactedKey
+	}
+	return baseURL, key
 }
 
 // DefaultClient backs all deprecated package-level helpers.
@@ -181,13 +267,28 @@ type APIErrorItem struct {
 // CodeInt — код этой ошибки числом.
 func (i APIErrorItem) CodeInt() int { return i.Code.Int() }
 
+// APIError is an error answered by the API or by the edge in front of it. The API key never appears
+// in it: Body and the messages carry "***" in its place. Body of a reply without the JSON envelope
+// (an HTML page, plain text, truncated JSON) keeps at most 500 characters.
 type APIError struct {
 	HTTPStatus int
 	Status     string
 	Errors     []APIErrorItem
 	Data       interface{}
 	Body       string
+	// cause — причина, которую назвал SDK, когда сервер её не назвал (ErrUnexpectedResponse); см. Unwrap.
+	cause error
 }
+
+// ErrUnexpectedResponse marks an *APIError of a money or write call — order/make,
+// prolong/make/{type}, balance/add and the write endpoints — whose reply carried no JSON envelope:
+// an HTML page, an empty body, 204, a non-object or truncated JSON with a 2xx status, or an HTTP 5xx
+// page. The request may have been executed — the order created and paid — so check before retrying:
+//
+//	if errors.Is(err, api.ErrUnexpectedResponse) { /* look the order up in ListOrders first */ }
+//
+// See the README section "Timeouts and retries on payments".
+var ErrUnexpectedResponse = errors.New("unexpected response (no JSON envelope): the request may have been executed, check before retrying")
 
 // ApiError and ApiErrorItem are aliases for callers that prefer Go's mixed-case acronym style.
 type ApiError = APIError
@@ -197,11 +298,28 @@ func (e *APIError) Error() string {
 	if len(e.Errors) > 0 {
 		return fmt.Sprintf("client api error %v: %s", e.Errors[0].Code, e.Errors[0].Message)
 	}
+	if e.cause != nil {
+		if e.HTTPStatus > 0 {
+			return fmt.Sprintf("client api HTTP %d: %v", e.HTTPStatus, e.cause)
+		}
+		return "client api error: " + e.cause.Error()
+	}
+	// status="error" с пустым errors[] на денежном или записывающем вызове: причина — в data.warning
+	// (так сервер описывает, например, нехватку средств), иначе текст был бы только «HTTP 200».
+	if data, isMap := e.Data.(map[string]interface{}); isMap && e.Status == "error" {
+		if warning, isText := data["warning"].(string); isText && strings.TrimSpace(warning) != "" {
+			return "client api error: " + warning
+		}
+	}
 	if e.HTTPStatus > 0 {
 		return fmt.Sprintf("client api HTTP %d", e.HTTPStatus)
 	}
 	return "client api error"
 }
+
+// Unwrap returns the reason the SDK gave to the error when the server gave none — currently only
+// ErrUnexpectedResponse — so that errors.Is(err, ErrUnexpectedResponse) works.
+func (e *APIError) Unwrap() error { return e.cause }
 
 // CodeInt — код ПЕРВОЙ ошибки. Ошибок в ответе может быть несколько (например тройка
 // ошибок доступа), поэтому для проверок лучше HasCode/Messages.
@@ -270,15 +388,23 @@ func normalizeBaseURL(baseURL string) string {
 }
 
 // SetApiKey Key placed in https://proxy-seller.com/personal/api/
+//
+// Deprecated: SetApiKey changes DefaultClient, the one state of the package-level API for the whole
+// process: every goroutine and every caller shares it, so two callers with different keys send
+// requests — orders included — with each other's key. Use NewClient(key, ...) and its methods.
 func SetApiKey(key string) {
 	DefaultClient.SetAPIKey(key)
 }
 
 func (c *Client) SetAPIKey(key string) { c.mu.Lock(); c.apiKey = key; c.mu.Unlock() }
 
+// SetBaseURL sets the base URL of the client. It becomes the client's own one: while the
+// package-level URL overrides DefaultClient (see URL), the package-level functions keep using URL,
+// and they come back to this value once URL is DefaultBaseURL again.
 func (c *Client) SetBaseURL(baseURL string) {
 	c.mu.Lock()
 	c.baseURL = normalizeBaseURL(baseURL)
+	c.urlOverridden = false
 	c.mu.Unlock()
 }
 
@@ -286,6 +412,10 @@ func (c *Client) SetBaseURL(baseURL string) {
 // balance/add. Orders and renewals accept only the balance and the saved card — for them prefer
 // SetPaymentCode("balance") / SetPaymentCode("paddle_subscription"); balance/add takes an ObjectId
 // from balance/payments/list, which never lists the balance itself.
+//
+// Deprecated: SetPaymentId changes DefaultClient, the one state of the package-level API for the
+// whole process, shared by every goroutine and every caller. Use NewClient(key, ...) and pass the
+// payment per call (OrderRequest.PaymentID, ProlongRequest.PaymentID, the argument of AddBalance).
 func SetPaymentId(id string) {
 	DefaultClient.SetPaymentID(id)
 }
@@ -293,6 +423,11 @@ func SetPaymentId(id string) {
 // SetPaymentCode sets the payment code sent with orders and renewals: "balance" (pay from the
 // balance) or "paddle_subscription" (the saved card; needs an active card subscription) — the only
 // two systems order/make accepts. balance/add does not resolve codes — see AddBalance.
+//
+// Deprecated: SetPaymentCode changes DefaultClient, the one state of the package-level API for the
+// whole process, shared by every goroutine and every caller: one caller's code changes how another
+// one's order is paid. Use NewClient(key, ...) and pass the payment per call
+// (OrderRequest.PaymentCode, ProlongRequest.PaymentCode).
 func SetPaymentCode(code string) { DefaultClient.SetPaymentCode(code) }
 
 // SetPaymentID — see the package-level SetPaymentId.
@@ -319,6 +454,10 @@ func (c *Client) GetPaymentID() string   { c.mu.RLock(); defer c.mu.RUnlock(); r
 func (c *Client) GetPaymentCode() string { c.mu.RLock(); defer c.mu.RUnlock(); return c.paymentCode }
 
 // SetGenerateAuth Y or N
+//
+// Deprecated: SetGenerateAuth changes DefaultClient, the one state of the package-level API for the
+// whole process, shared by every goroutine and every caller. Use NewClient(key, ...) and
+// OrderRequest.GenerateAuth for a single order.
 func SetGenerateAuth(yn string) {
 	DefaultClient.SetGenerateAuth(yn)
 }
@@ -341,6 +480,10 @@ func (c *Client) GetGenerateAuth() string { c.mu.RLock(); defer c.mu.RUnlock(); 
 
 // SetFingerprint X-Fingerprint value of this installation (see WithFingerprint).
 // Стабильная непрозрачная строка; SDK её не генерирует и по форме не проверяет.
+//
+// Deprecated: SetFingerprint changes DefaultClient, the one state of the package-level API for the
+// whole process, shared by every goroutine and every caller. Use NewClient(key,
+// WithFingerprint(...)) and OrderRequest.Fingerprint for a single order.
 func SetFingerprint(fingerprint string) {
 	DefaultClient.SetFingerprint(fingerprint)
 }
@@ -380,11 +523,28 @@ func Request(method string, uri string, data map[string]interface{}) (ResultData
 	return legacyClient().Request(method, uri, data)
 }
 
+// legacyClient — клиент пакетных функций, DefaultClient.
+//
+// Переменная URL подменяет его базовый URL, только пока отличается от DefaultBaseURL, то есть пока
+// её действительно поменяли. Раньше она применялась на каждом вызове безусловно, а её значение по
+// умолчанию — прод: DefaultClient, заменённый на NewClient(key, WithBaseURL(mock)), как советует
+// README, молча уходил на прод, вплоть до order/make. Когда URL возвращают к DefaultBaseURL (или
+// очищают), клиенту возвращается собственный адрес, запомненный перед подменой, — у каждого клиента
+// свой, поэтому подмена DefaultClient в любой момент ничего не путает.
 func legacyClient() *Client {
-	if URL != "" {
-		DefaultClient.SetBaseURL(URL)
+	client := DefaultClient
+	override := URL
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if override != "" && normalizeBaseURL(override) != DefaultBaseURL {
+		if !client.urlOverridden {
+			client.ownBaseURL, client.urlOverridden = client.baseURL, true
+		}
+		client.baseURL = normalizeBaseURL(override)
+	} else if client.urlOverridden {
+		client.baseURL, client.urlOverridden = client.ownBaseURL, false
 	}
-	return DefaultClient
+	return client
 }
 
 func RequestBinary(uri string) []byte {
@@ -402,9 +562,30 @@ func (c *Client) snapshot() (string, string, *http.Client, error) {
 	}
 	httpClient := c.httpClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+		httpClient = &http.Client{Timeout: defaultTimeout}
 	}
 	return normalizeBaseURL(c.baseURL), c.apiKey, httpClient, nil
+}
+
+// moneyHTTPClient — http-клиент денежного запроса: его Timeout — max(таймаут клиента,
+// money-таймаут). order/make большого заказа обрабатывается синхронно и легко идёт дольше 30 с, а
+// обрезанный клиентом денежный запрос — это созданный и оплаченный заказ, который выглядит ошибкой и
+// провоцирует повтор. Исходный *http.Client (в том числе пользовательский из WithHTTPClient) не
+// меняется: берётся его копия с тем же Transport (и пулом соединений), Jar и CheckRedirect.
+// Timeout <= 0 у клиента — «без таймаута», такой клиент остаётся как есть.
+func (c *Client) moneyHTTPClient(httpClient *http.Client) *http.Client {
+	c.mu.RLock()
+	timeout := c.moneyTimeout
+	c.mu.RUnlock()
+	if timeout == 0 {
+		timeout = defaultMoneyTimeout
+	}
+	if timeout < 0 || httpClient.Timeout <= 0 || httpClient.Timeout >= timeout {
+		return httpClient
+	}
+	extended := *httpClient
+	extended.Timeout = timeout
+	return &extended
 }
 
 // Request sends any API call by its path relative to the API root ("order/list", "prolong/make/ipv4").
@@ -417,37 +598,54 @@ func (c *Client) Request(method, uri string, data interface{}) (ResultData, erro
 // Нужен для X-Fingerprint на order/make; пустые имена и значения пропускаются, чтобы
 // незаданный отпечаток не уезжал пустым заголовком.
 func (c *Client) RequestWithHeaders(method, uri string, data interface{}, headers map[string]string) (ResultData, error) {
-	body, status, err := c.doWithHeaders(method, uri, data, headers)
+	resp, err := c.doWithHeaders(method, uri, data, headers)
 	if err != nil {
 		return NewResultData(), err
 	}
-	return parseEnvelope(body, status)
+	return resp.parse()
 }
 
-func (c *Client) do(method, uri string, data interface{}) ([]byte, int, error) {
+// response — ответ одного API-вызова до разбора конверта.
+type response struct {
+	body   []byte
+	status int
+	// strict — денежный или записывающий запрос: успех там только status == "success", см. parseResponse.
+	strict bool
+	// key — ключ, с которым ушёл запрос: его вычищают из ошибок разбора.
+	key string
+}
+
+func (r response) parse() (ResultData, error) {
+	return parseResponse(r.body, r.status, r.strict, r.key)
+}
+
+func (c *Client) do(method, uri string, data interface{}) (response, error) {
 	return c.doWithHeaders(method, uri, data, nil)
 }
 
 // doWithHeaders — единственное место, откуда SDK отправляет HTTP-запросы, а значит и единственное
 // место, где задаётся их темп: каждый запрос проходит через rateLimiter клиента (общее окно, очередь
 // записи, повтор HTTP 429 — см. ratelimit.go), а категорию запроса определяет classifyRequest по пути.
-func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map[string]string) ([]byte, int, error) {
+// По той же категории денежный запрос получает свой таймаут (moneyHTTPClient), а денежный и
+// записывающий — строгий разбор ответа (parseResponse). Ошибки транспорта уходят наружу без
+// API-ключа (redactTransportError).
+func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map[string]string) (response, error) {
 	baseURL, key, httpClient, err := c.snapshot()
 	if err != nil {
-		return nil, 0, err
+		return response{}, err
 	}
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid client api base URL: %w", err)
+		return response{}, fmt.Errorf("invalid client api base URL: %w", err)
 	}
 	relative, err := url.Parse(uri)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid client api path: %w", err)
+		return response{}, fmt.Errorf("invalid client api path: %w", err)
 	}
 	escapedPath := strings.TrimRight(parsed.EscapedPath(), "/") + "/" + url.PathEscape(key) + "/" + strings.TrimLeft(relative.EscapedPath(), "/")
 	parsed.Path, err = url.PathUnescape(escapedPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid client api escaped path: %w", err)
+		return response{}, fmt.Errorf("invalid client api escaped path: %w", err)
 	}
 	parsed.RawPath = escapedPath
 	parsed.RawQuery = relative.RawQuery
@@ -455,8 +653,12 @@ func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map
 	if method != http.MethodGet && method != http.MethodHead && data != nil {
 		payload, err = json.Marshal(data)
 		if err != nil {
-			return nil, 0, err
+			return response{}, err
 		}
+	}
+	category := classifyRequest(relative.EscapedPath())
+	if category == categoryMoney {
+		httpClient = c.moneyHTTPClient(httpClient)
 	}
 	target := parsed.String()
 	// Один HTTP-обмен. На HTTP 429 лимитер вызывает его ещё раз, поэтому запрос и reader тела
@@ -490,33 +692,70 @@ func (c *Client) doWithHeaders(method, uri string, data interface{}, headers map
 		}
 		return exchangeResult{status: resp.StatusCode, header: resp.Header, body: body}
 	}
-	result := c.requestLimiter().run(classifyRequest(relative.EscapedPath()), exchange)
-	return result.body, result.status, result.err
+	result := c.requestLimiter().run(category, exchange)
+	if result.err != nil {
+		return response{}, redactTransportError(result.err, key)
+	}
+	return response{body: result.body, status: result.status, strict: category != categoryRead, key: key}, nil
 }
 
+// parseEnvelope — разбор конверта по правилам чтений и без ключа.
 func parseEnvelope(body []byte, httpStatus int) (ResultData, error) {
+	return parseResponse(body, httpStatus, false, "")
+}
+
+// parseResponse разбирает конверт {status, data, errors}.
+//
+// strict — денежный или записывающий запрос (категория по пути, см. classifyRequest), и успехом
+// там считается ТОЛЬКО status == "success". Мягкое правило — status="error" с data и пустым
+// errors[] отдаётся как успех с ResultData.Status == "error" — законно лишь для */calc (так сервер
+// отвечает о нехватке средств на prolong/calc и autoprolong/calc), а все calc-маршруты читающие. На
+// make и записи та же форма — ошибка: раньше она проходила успехом на любом маршруте.
+//
+// Ответ без конверта (HTML, пустое тело, 204, не-объект, обрезанный JSON, неизвестный status) на
+// строгом запросе со статусом 2xx или 5xx — ошибка с причиной ErrUnexpectedResponse: запрос мог
+// выполниться, а раньше такой ответ уходил наружу голой ошибкой разбора JSON, по которой не понять,
+// что заказ, возможно, уже создан. 4xx (в том числе 429 эджа — до API запрос не дошёл) остаются
+// обычной APIError. Чтения и выгрузки разбираются как раньше.
+//
+// key — ключ запроса: его вычищают из тела и текстов ошибки, а тело ответа без конверта ещё и
+// обрезают (errorBody).
+func parseResponse(body []byte, httpStatus int, strict bool, key string) (ResultData, error) {
+	httpOK := httpStatus >= 200 && httpStatus < 300
+	// outcomeUnknown — без конверта такой ответ не говорит, выполнился ли строгий запрос.
+	outcomeUnknown := strict && (httpOK || httpStatus >= 500)
 	var envelope struct {
 		Status string          `json:"status"`
 		Data   json.RawMessage `json:"data"`
 		Errors []APIErrorItem  `json:"errors"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		if httpStatus < 200 || httpStatus >= 300 {
-			return NewResultData(), &APIError{HTTPStatus: httpStatus, Body: string(body)}
+		if outcomeUnknown {
+			return NewResultData(), unexpectedResponse(body, httpStatus, key)
+		}
+		if !httpOK {
+			return NewResultData(), &APIError{HTTPStatus: httpStatus, Body: errorBody(body, false, keyRedactor(key))}
 		}
 		return NewResultData(), err
 	}
 	var value interface{}
 	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
 		if err := json.Unmarshal(envelope.Data, &value); err != nil {
+			if outcomeUnknown {
+				return NewResultData(), unexpectedResponse(body, httpStatus, key)
+			}
 			return NewResultData(), err
 		}
 	}
-	httpOK := httpStatus >= 200 && httpStatus < 300
-	if httpOK && (envelope.Status == "success" || (envelope.Status == "error" && len(envelope.Errors) == 0 && value != nil)) {
+	isEnvelope := envelope.Status == "success" || envelope.Status == "error"
+	warningOnly := !strict && envelope.Status == "error" && len(envelope.Errors) == 0 && value != nil
+	if httpOK && (envelope.Status == "success" || warningOnly) {
 		result := tryConvert(value)
 		result.Raw, result.Status = envelope.Data, envelope.Status
 		return result, nil
+	}
+	if outcomeUnknown && !isEnvelope {
+		return NewResultData(), unexpectedResponse(body, httpStatus, key)
 	}
 	if envelope.Status != "" || !httpOK {
 		if len(envelope.Errors) == 0 {
@@ -525,28 +764,205 @@ func parseEnvelope(body []byte, httpStatus int) (ResultData, error) {
 				envelope.Errors = []APIErrorItem{direct}
 			}
 		}
-		return NewResultData(), &APIError{HTTPStatus: httpStatus, Status: envelope.Status, Errors: envelope.Errors, Data: value, Body: string(body)}
+		redact := keyRedactor(key)
+		for i := range envelope.Errors {
+			item := &envelope.Errors[i]
+			item.Message, item.Code = redact(item.Message), APIErrorCode(redact(string(item.Code)))
+			item.CustomData = redactValue(item.CustomData, redact)
+		}
+		return NewResultData(), &APIError{HTTPStatus: httpStatus, Status: redact(envelope.Status), Errors: envelope.Errors,
+			Data: redactValue(value, redact), Body: errorBody(body, isEnvelope, redact)}
 	}
 	return NewResultData(), fmt.Errorf("unexpected client api response")
 }
 
+// unexpectedResponse — ошибка строгого запроса, ответ на который пришёл без JSON-конверта.
+func unexpectedResponse(body []byte, httpStatus int, key string) *APIError {
+	return &APIError{HTTPStatus: httpStatus, Body: errorBody(body, false, keyRedactor(key)), cause: ErrUnexpectedResponse}
+}
+
 func (c *Client) RequestBinary(uri string) ([]byte, error) {
-	body, status, err := c.do(http.MethodGet, uri, nil)
+	resp, err := c.do(http.MethodGet, uri, nil)
 	if err != nil {
 		return nil, err
 	}
-	if status < 200 || status >= 300 {
-		_, parseErr := parseEnvelope(body, status)
+	if resp.status < 200 || resp.status >= 300 {
+		_, parseErr := resp.parse()
 		return nil, parseErr
 	}
 	var marker struct {
 		Status string `json:"status"`
 	}
-	if json.Unmarshal(body, &marker) == nil && marker.Status == "error" {
-		_, parseErr := parseEnvelope(body, status)
+	if json.Unmarshal(resp.body, &marker) == nil && marker.Status == "error" {
+		_, parseErr := resp.parse()
 		return nil, parseErr
 	}
-	return body, nil
+	return resp.body, nil
+}
+
+/////////////////////////////// Errors without the API key ///////////////////////////////
+
+// redactedKey — чем API-ключ заменяется в ошибках и в представлении клиента.
+const redactedKey = "***"
+
+// maxErrorBodyLength — сколько символов тела ответа без JSON-конверта остаётся в APIError.Body:
+// HTML-страница фронта или гигантский ответ не должны целиком жить в ошибке.
+const maxErrorBodyLength = 500
+
+// keyRedactor — функция, вычищающая API-ключ из текста. Ключ стоит в пути URL, и его эхо приходит
+// в ошибки: *url.Error несёт полный URL запроса или редиректа, Spring кладёт путь в поле "path"
+// тела ошибки, страница 404 фронта — в канонический URL. Ищутся сам ключ и его URL-кодированные
+// формы, без учёта регистра: фронт стейджа отдаёт путь в нижнем регистре. Пустой ключ ничего не
+// вычищает.
+func keyRedactor(key string) func(string) string {
+	if key == "" {
+		return func(text string) string { return text }
+	}
+	forms := []string{key}
+	for _, form := range []string{url.PathEscape(key), url.QueryEscape(key)} {
+		known := false
+		for _, seen := range forms {
+			known = known || strings.EqualFold(seen, form)
+		}
+		if !known {
+			forms = append(forms, form)
+		}
+	}
+	// Альтернативы regexp пробуются слева направо, поэтому длинные формы — раньше коротких.
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	for i, form := range forms {
+		forms[i] = regexp.QuoteMeta(form)
+	}
+	pattern := regexp.MustCompile("(?i)" + strings.Join(forms, "|"))
+	return func(text string) string { return pattern.ReplaceAllLiteralString(text, redactedKey) }
+}
+
+// errorBody — тело ответа для APIError.Body: без API-ключа, а тело ответа без конверта (HTML,
+// текст, обрезанный JSON) ещё и обрезано до maxErrorBodyLength символов. Ключ вычищается до обрезки,
+// иначе граница могла бы разрезать его и оставить часть на виду.
+func errorBody(body []byte, envelope bool, redact func(string) string) string {
+	text := redact(string(body))
+	if envelope {
+		return text
+	}
+	count := 0
+	for at := range text {
+		if count == maxErrorBodyLength {
+			return text[:at] + fmt.Sprintf("... [truncated, %d bytes in total]", len(body))
+		}
+		count++
+	}
+	return text
+}
+
+// redactValue вычищает ключ из строк разобранного JSON (data, customData), на месте.
+func redactValue(value interface{}, redact func(string) string) interface{} {
+	switch typed := value.(type) {
+	case string:
+		return redact(typed)
+	case map[string]interface{}:
+		for name, item := range typed {
+			typed[name] = redactValue(item, redact)
+		}
+	case []interface{}:
+		for i, item := range typed {
+			typed[i] = redactValue(item, redact)
+		}
+	}
+	return value
+}
+
+// redactTransportError вычищает API-ключ из ошибки транспорта (http.NewRequest, http.Client.Do,
+// чтение тела). *url.Error, которую отдаёт http.Client.Do, несёт полный URL запроса, а в нём
+// ключ, — наружу уходит её копия с вычищенным URL. Вложенная ошибка остаётся как есть, если ключа
+// нет ни в её тексте, ни глубже по цепочке, — тогда errors.Is / errors.As и net.Error работают как
+// раньше. Иначе её место занимает redactedError: текст без ключа и те же признаки таймаута и
+// отмены, а сырая ошибка наружу не уходит вовсе — до неё не добраться и через errors.Unwrap.
+func redactTransportError(err error, key string) error {
+	if err == nil || key == "" {
+		return err
+	}
+	redact := keyRedactor(key)
+	if urlErr, ok := err.(*url.Error); ok {
+		return &url.Error{Op: urlErr.Op, URL: redact(urlErr.URL), Err: redactWrappedError(urlErr.Err, redact)}
+	}
+	return redactWrappedError(err, redact)
+}
+
+func redactWrappedError(err error, redact func(string) string) error {
+	if err == nil || !leaksKey(err, redact, 0) {
+		return err
+	}
+	return newRedactedError(err, redact(err.Error()))
+}
+
+// leaksKey — есть ли ключ в тексте ошибки или любой ошибки под ней. Слишком длинная цепочка
+// считается протекающей: лучше потерять вложенную ошибку, чем ключ.
+func leaksKey(err error, redact func(string) string, depth int) bool {
+	if err == nil {
+		return false
+	}
+	if depth > 16 {
+		return true
+	}
+	if text := err.Error(); redact(text) != text {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, inner := range wrapped.Unwrap() {
+			if leaksKey(inner, redact, depth+1) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return leaksKey(wrapped.Unwrap(), redact, depth+1)
+	}
+	return false
+}
+
+// redactedError — ошибка транспорта, из текста которой вычищен API-ключ. Исходную ошибку она не
+// хранит и переносит только то, по чему на ошибку транспорта ветвятся: таймаут (net.Error,
+// os.IsTimeout) и отмену или дедлайн (errors.Is с context.Canceled, context.DeadlineExceeded,
+// os.ErrDeadlineExceeded).
+type redactedError struct {
+	text                           string
+	timeout, temporary             bool
+	canceled, deadline, osDeadline bool
+}
+
+func newRedactedError(err error, text string) *redactedError {
+	redacted := &redactedError{
+		text:       text,
+		canceled:   errors.Is(err, context.Canceled),
+		deadline:   errors.Is(err, context.DeadlineExceeded),
+		osDeadline: errors.Is(err, os.ErrDeadlineExceeded),
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) {
+		redacted.timeout = timeout.Timeout()
+	}
+	var temporary interface{ Temporary() bool }
+	if errors.As(err, &temporary) {
+		redacted.temporary = temporary.Temporary()
+	}
+	return redacted
+}
+
+func (e *redactedError) Error() string   { return e.text }
+func (e *redactedError) Timeout() bool   { return e.timeout }
+func (e *redactedError) Temporary() bool { return e.temporary }
+
+func (e *redactedError) Is(target error) bool {
+	switch target {
+	case context.Canceled:
+		return e.canceled
+	case context.DeadlineExceeded:
+		return e.deadline
+	case os.ErrDeadlineExceeded:
+		return e.osDeadline
+	}
+	return false
 }
 
 // MaxProxyDownloadExtLength — предел длины ext на выгрузках: значение длиннее 250 символов

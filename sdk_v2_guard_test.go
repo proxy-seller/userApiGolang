@@ -1,16 +1,26 @@
 package userApiGolang
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newTestClient поднимает локальный стенд и отдаёт клиент, созданный через NewClient —
@@ -1055,5 +1065,762 @@ func TestOrderListWithoutFiltersSendsBarePath(t *testing.T) {
 	}
 	if !strings.HasSuffix(captured, "/order/list") {
 		t.Fatalf("путь = %s, ожидался .../order/list", captured)
+	}
+}
+
+/////////////////////////////// Ключ в ошибках (F3) ///////////////////////////////
+
+// keyForms — формы ключа, которых не должно быть ни в одной ошибке: сам ключ, он же в нижнем и
+// верхнем регистре (фронт стейджа отдаёт путь в нижнем регистре) и URL-кодированные формы.
+func keyForms(key string) []string {
+	return []string{key, strings.ToLower(key), strings.ToUpper(key),
+		url.PathEscape(key), strings.ToLower(url.PathEscape(key)),
+		url.QueryEscape(key), strings.ToLower(url.QueryEscape(key))}
+}
+
+// assertNoKey проверяет текст ошибки, её представления для fmt и JSON — у неё самой и у каждой
+// ошибки по цепочке Unwrap, — а у *APIError ещё Body, сообщения и Data.
+func assertNoKey(t *testing.T, what string, err error, key string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: ожидалась ошибка", what)
+	}
+	var views []string
+	for e, depth := err, 0; e != nil && depth < 32; e, depth = errors.Unwrap(e), depth+1 {
+		encoded, _ := json.Marshal(e)
+		views = append(views, e.Error(), fmt.Sprintf("%v", e), fmt.Sprintf("%+v", e), fmt.Sprintf("%#v", e),
+			fmt.Sprintf("%s", e), string(encoded))
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		encoded, _ := json.Marshal(apiErr)
+		views = append(views, apiErr.Body, apiErr.Status, fmt.Sprintf("%#v", *apiErr), string(encoded),
+			strings.Join(apiErr.Messages(), " | "), fmt.Sprintf("%#v", apiErr.Data), fmt.Sprintf("%#v", apiErr.FirstCustomData()))
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		views = append(views, urlErr.URL, fmt.Sprintf("%#v", *urlErr))
+	}
+	for _, view := range views {
+		for _, form := range keyForms(key) {
+			if strings.Contains(view, form) {
+				t.Fatalf("%s: ключ (%q) виден в представлении ошибки: %s", what, form, view)
+			}
+		}
+	}
+}
+
+// leakyTimeoutError — ошибка транспорта, которая цитирует URL запроса (так делают обёртки с
+// повторами) и при этом сообщает о таймауте.
+type leakyTimeoutError struct{ url string }
+
+func (e *leakyTimeoutError) Error() string        { return "giving up on " + e.url + " after 3 attempts" }
+func (e *leakyTimeoutError) Timeout() bool        { return true }
+func (e *leakyTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }
+
+// Ключ стоит в пути URL, и его эхо приходит в ошибки отовсюду: *url.Error с полным URL (порт закрыт,
+// редирект, ошибка транспорта, цитирующая URL), страница 404 фронта с путём в нижнем регистре, тело
+// ошибки Spring с полем path, конверт, чьё сообщение цитирует путь. Ни в тексте ошибки, ни в её
+// представлениях для fmt и JSON, ни в Body, ни глубже по цепочке ключа быть не должно — ни как есть,
+// ни в другом регистре, ни URL-кодированным. Второй ключ — с символами, которые кодируются.
+func TestErrorsNeverCarryTheAPIKey(t *testing.T) {
+	for _, key := range []string{"FakeKeyABCdef0123456789", "Fake Key+/0123abcDEF"} {
+		key := key
+		t.Run(key, func(t *testing.T) {
+			// Порт закрыт.
+			closed := httptest.NewServer(http.NotFoundHandler())
+			closedURL := closed.URL
+			closed.Close()
+			offline := NewClient(key, WithBaseURL(closedURL+"/personal/api/v2/"))
+			useFakeClock(offline, newFakeClock())
+			_, err := offline.Balance()
+			assertNoKey(t, "порт закрыт, balance/get", err, key)
+			var urlErr *url.Error
+			if !errors.As(err, &urlErr) || !strings.Contains(urlErr.URL, "/personal/api/v2/***/balance/get") {
+				t.Fatalf("ожидалась *url.Error с вычищенным URL, получено %T: %v", err, err)
+			}
+			var opErr *net.OpError
+			if !errors.As(err, &opErr) {
+				t.Fatalf("вложенная ошибка без ключа должна остаться в цепочке как есть, получено %#v", err)
+			}
+			_, err = offline.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+			assertNoKey(t, "порт закрыт, order/make", err, key)
+
+			// Ошибка транспорта сама цитирует URL с ключом: она заменяется целиком, но признаки
+			// таймаута и дедлайна остаются, а сырая ошибка не достаётся даже через errors.As.
+			leaky := NewClient(key, WithHTTPClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return nil, &leakyTimeoutError{url: r.URL.String()}
+			})}))
+			useFakeClock(leaky, newFakeClock())
+			_, err = leaky.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+			assertNoKey(t, "транспорт цитирует URL", err, key)
+			if !os.IsTimeout(err) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("признаки таймаута потеряны: %v", err)
+			}
+			var raw *leakyTimeoutError
+			if errors.As(err, &raw) {
+				t.Fatal("сырая ошибка с ключом осталась в цепочке")
+			}
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.HasSuffix(path, "/balance/get"):
+					// страница 404 фронта: канонический URL в нижнем регистре
+					w.Header().Set("Content-Type", "text/html")
+					w.WriteHeader(http.StatusNotFound)
+					fmt.Fprintf(w, `<html><head><link rel="canonical" href="https://front.example%s/"/></head><body>Not found</body></html>`, strings.ToLower(path))
+				case strings.HasSuffix(path, "/order/make"), strings.HasSuffix(path, "/order/list"):
+					// Spring: путь в поле path
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusInternalServerError)
+					fmt.Fprintf(w, `{"timestamp":"2026-10-01T12:00:00.000+00:00","status":500,"error":"Internal Server Error","path":%q,"raw":%q}`, path, r.URL.EscapedPath())
+				case strings.HasSuffix(path, "/proxy/replace"):
+					// конверт, сообщение, customData и data которого цитируют путь
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprintf(w, `{"status":"error","data":{"path":%q,"list":[%q]},"errors":[{"message":"Unknown path %s","code":0,"customData":{"path":%q}}]}`,
+						r.URL.EscapedPath(), strings.ToLower(path), strings.ToUpper(path), path)
+				case strings.HasSuffix(path, "/auth/add/ip"):
+					// 200 HTML без конверта на запись
+					w.Header().Set("Content-Type", "text/html")
+					fmt.Fprintf(w, "<html><body>%s %s</body></html>", r.URL.EscapedPath(), strings.ToLower(path))
+				default:
+					// бесконечный редирект на тот же путь в нижнем регистре
+					http.Redirect(w, r, strings.ToLower(r.URL.EscapedPath())+"/", http.StatusFound)
+				}
+			}))
+			t.Cleanup(server.Close)
+			client := NewClient(key, WithBaseURL(server.URL+"/personal/api/v2/"))
+			useFakeClock(client, newFakeClock())
+
+			_, err = client.Balance()
+			assertNoKey(t, "404 фронта", err, key)
+			expectHTTPStatus(t, err, http.StatusNotFound)
+
+			_, err = client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+			assertNoKey(t, "500 Spring на order/make", err, key)
+			if !errors.Is(err, ErrUnexpectedResponse) {
+				t.Fatalf("500 без конверта на order/make: ожидалась ErrUnexpectedResponse, получено %v", err)
+			}
+
+			_, err = client.ListOrders(OrderListOptions{})
+			assertNoKey(t, "500 Spring на order/list", err, key)
+			if apiErr := expectHTTPStatus(t, err, http.StatusInternalServerError); !strings.Contains(apiErr.Body, `"path":"/personal/api/v2/***/order/list"`) {
+				t.Fatalf("путь в теле должен остаться, а ключ — смениться на ***: %s", apiErr.Body)
+			}
+
+			_, err = client.ProxyReplace([]string{testProxyID}, ProxyReplaceReasonNotWork, "")
+			assertNoKey(t, "конверт цитирует путь", err, key)
+			if messages := expectHTTPStatus(t, err, http.StatusOK).Messages(); len(messages) != 1 || !strings.Contains(messages[0], "/***/") {
+				t.Fatalf("сообщение должно сохраниться без ключа: %#v", messages)
+			}
+
+			_, err = client.AuthAddIp("LH-1", "1.2.3.4")
+			assertNoKey(t, "200 HTML на запись", err, key)
+
+			_, err = client.ResidentPackage()
+			assertNoKey(t, "редирект в нижний регистр", err, key)
+			if !errors.As(err, &urlErr) || !strings.Contains(urlErr.URL, "***") {
+				t.Fatalf("ожидалась *url.Error редиректа с вычищенным URL, получено %T: %v", err, err)
+			}
+
+			// Сам клиент тоже печатается без ключа — и напрямую, и полем чужой структуры.
+			for _, view := range []string{fmt.Sprintf("%v", client), fmt.Sprintf("%+v", client), fmt.Sprintf("%#v", client),
+				fmt.Sprintf("%s", client), fmt.Sprintf("%+v", struct{ API *Client }{client})} {
+				for _, form := range keyForms(key) {
+					if strings.Contains(view, form) {
+						t.Fatalf("ключ (%q) виден в представлении клиента: %s", form, view)
+					}
+				}
+				if !strings.Contains(view, `"***"`) {
+					t.Fatalf("представление клиента должно показывать ключ как ***: %s", view)
+				}
+			}
+		})
+	}
+}
+
+// keyRedactor ловит ключ в любом регистре и в URL-кодированных формах, пустой ключ ничего не трогает.
+func TestKeyRedactorForms(t *testing.T) {
+	redact := keyRedactor("Fake Key+/0123abcDEF")
+	cases := map[string]string{
+		"/v2/Fake Key+/0123abcDEF/balance/get":              "/v2/***/balance/get",
+		"/v2/fake key+/0123abcdef/balance/get":              "/v2/***/balance/get",
+		"/v2/FAKE KEY+/0123ABCDEF/balance/get":              "/v2/***/balance/get",
+		"/v2/Fake%20Key+%2F0123abcDEF/balance/get":          "/v2/***/balance/get",
+		"/v2/fake%20key+%2f0123abcdef/balance/get":          "/v2/***/balance/get",
+		"?key=Fake+Key%2B%2F0123abcDEF&x=1":                 "?key=***&x=1",
+		"twice: Fake Key+/0123abcDEF, fake key+/0123abcdef": "twice: ***, ***",
+		"no key here": "no key here",
+		"":            "",
+	}
+	for input, want := range cases {
+		if got := redact(input); got != want {
+			t.Errorf("redact(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if got := keyRedactor("")("FakeKey"); got != "FakeKey" {
+		t.Fatalf("пустой ключ не должен ничего вычищать, получено %q", got)
+	}
+	// Тело без конверта обрезается после вычистки: ключ на границе не остаётся наполовину.
+	body := strings.Repeat("x", maxErrorBodyLength-3) + "Fake Key+/0123abcDEF" + strings.Repeat("y", 100)
+	got := errorBody([]byte(body), false, redact)
+	if strings.Contains(got, "Fake") || !strings.HasPrefix(got, strings.Repeat("x", maxErrorBodyLength-3)+"***") ||
+		!strings.Contains(got, fmt.Sprintf("[truncated, %d bytes in total]", len(body))) {
+		t.Fatalf("тело обрезано неверно: %q", got)
+	}
+	if got := errorBody([]byte(`{"status":"error","path":"/Fake Key+/0123abcDEF/`+strings.Repeat("z", 600)+`"}`), true, redact); strings.Contains(got, "truncated") || strings.Contains(got, "Fake") {
+		t.Fatalf("тело конверта не обрезается, но ключ из него вычищается: %q", got)
+	}
+}
+
+/////////////////////////////// Строгий успех money и write (F4) ///////////////////////////////
+
+// stubStatus отвечает на каждый запрос одним и тем же статусом и телом.
+func stubStatus(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if body != "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// strictCalls — денежные и записывающие вызовы, на которых успехом считается только
+// status == "success".
+func strictCalls() map[string]func(*Client) error {
+	return map[string]func(*Client) error{
+		"MakeOrder (money)": func(c *Client) error {
+			_, err := c.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+			return err
+		},
+		"OrderMakeIpv4 (money)": func(c *Client) error {
+			_, err := c.OrderMakeIpv4("USA", "1m", 1, "", "", "seo")
+			return err
+		},
+		"MakeProlong (money)": func(c *Client) error {
+			_, err := c.MakeProlong("ipv4", ProlongRequest{IDs: []string{testProxyID}, PeriodID: "1m"})
+			return err
+		},
+		"AddBalance (money)": func(c *Client) error { _, err := c.AddBalance(10, testProxyID); return err },
+		"EnableAutoProlong (write)": func(c *Client) error {
+			_, err := c.EnableAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{
+				IDs: []string{testProxyID}, PeriodID: "1m", PaymentID: "balance"}})
+			return err
+		},
+		"ProxyReplace (write)": func(c *Client) error {
+			_, err := c.ProxyReplace([]string{testProxyID}, ProxyReplaceReasonNotWork, "")
+			return err
+		},
+		"ResidentsubuserListDelete (write, DELETE)": func(c *Client) error {
+			_, err := c.ResidentsubuserListDelete("f9ea7063d7a699b12b3e", "123")
+			return err
+		},
+	}
+}
+
+// На money и write успех — только status == "success". status="error" — ошибка, даже с data и
+// пустым errors[]. Ответ без JSON-конверта (HTML, пустое тело, 204, не-объект, обрезанный JSON,
+// неизвестный status) со статусом 2xx или 5xx — ошибка с причиной ErrUnexpectedResponse и понятным
+// текстом: запрос мог выполниться. Раньше status="error" с data проходил успехом на любом маршруте,
+// а HTML 200 давал голую *json.SyntaxError.
+func TestMoneyAndWriteCallsSucceedOnlyOnStatusSuccess(t *testing.T) {
+	gatewayPage := "<!DOCTYPE html><html><body>" + strings.Repeat("<p>Bad gateway</p>", 60) + "</body></html>"
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		unexpected bool // ожидается ErrUnexpectedResponse
+		code       int  // код, который должен быть в errors[]; 0 — проверять не нужно
+	}{
+		{"error with errors[]", 200, `{"status":"error","data":null,"errors":[{"code":16,"message":"Insufficient funds on balance"}]}`, false, 16},
+		{"error with data and an empty errors[]", 200, `{"status":"error","data":{"warning":"Insufficient funds. Total $2. Not enough $33.10","total":35.1},"errors":[]}`, false, 0},
+		{"HTML 200", 200, gatewayPage, true, 0},
+		{"empty body", 200, "", true, 0},
+		{"204 No Content", 204, "", true, 0},
+		{"JSON null", 200, "null", true, 0},
+		{"array", 200, `[1,2]`, true, 0},
+		{"string", 200, `"ok"`, true, 0},
+		{"truncated JSON", 200, `{"status":"success","data":{"orderId":"68b1f0c4`, true, 0},
+		{"object without status", 200, `{}`, true, 0},
+		{"unknown status", 200, `{"status":"pending","data":{"orderId":"68b1f0c4e13a4c0f1a2b3c4d"}}`, true, 0},
+		{"HTTP 502 gateway page", 502, gatewayPage, true, 0},
+		{"HTTP 504 empty", 504, "", true, 0},
+		{"HTTP 500 Spring body", 500, `{"timestamp":"2026-10-01T12:00:00.000+00:00","status":500,"error":"Internal Server Error","path":"/x"}`, true, 0},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newTestClient(t, stubStatus(tc.status, tc.body))
+			for name, call := range strictCalls() {
+				err := call(client)
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) {
+					t.Fatalf("%s: ожидалась *APIError, получено %T: %v", name, err, err)
+				}
+				if apiErr.HTTPStatus != tc.status {
+					t.Fatalf("%s: HTTPStatus = %d, ожидался %d", name, apiErr.HTTPStatus, tc.status)
+				}
+				if got := errors.Is(err, ErrUnexpectedResponse); got != tc.unexpected {
+					t.Fatalf("%s: errors.Is(err, ErrUnexpectedResponse) = %v, ожидалось %v (%v)", name, got, tc.unexpected, err)
+				}
+				if tc.code != 0 && !apiErr.HasCode(tc.code) {
+					t.Fatalf("%s: код %d потерян: %v", name, tc.code, err)
+				}
+				if !tc.unexpected {
+					continue
+				}
+				if text := err.Error(); !strings.Contains(text, fmt.Sprintf("HTTP %d", tc.status)) ||
+					!strings.Contains(text, "no JSON envelope") || !strings.Contains(text, "may have been executed") {
+					t.Fatalf("%s: текст ошибки должен назвать статус и предупредить о возможном выполнении: %q", name, text)
+				}
+				if len(apiErr.Errors) != 0 {
+					t.Fatalf("%s: сервер ошибок не присылал, а в Errors что-то есть: %#v", name, apiErr.Errors)
+				}
+				if tc.body == gatewayPage && (!strings.HasPrefix(apiErr.Body, gatewayPage[:maxErrorBodyLength]) ||
+					!strings.Contains(apiErr.Body, fmt.Sprintf("[truncated, %d bytes in total]", len(gatewayPage)))) {
+					t.Fatalf("%s: тело без конверта должно быть обрезано до %d символов: %q", name, maxErrorBodyLength, apiErr.Body)
+				}
+			}
+		})
+	}
+
+	t.Run("status error keeps its data", func(t *testing.T) {
+		client, _ := newTestClient(t, stubStatus(200, `{"status":"error","data":{"warning":"Insufficient funds. Total $2. Not enough $33.10"},"errors":[]}`))
+		_, err := client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+		apiErr := expectHTTPStatus(t, err, http.StatusOK)
+		if data, _ := apiErr.Data.(map[string]interface{}); apiErr.Status != "error" || data["warning"] == nil {
+			t.Fatalf("status и data ответа должны остаться в ошибке: %#v", apiErr)
+		}
+		if got := err.Error(); got != "client api error: Insufficient funds. Total $2. Not enough $33.10" {
+			t.Fatalf("текст ошибки должен назвать причину из data.warning, получено %q", got)
+		}
+	})
+
+	t.Run("4xx and the edge 429 stay plain errors", func(t *testing.T) {
+		for _, status := range []int{http.StatusNotFound, http.StatusTooManyRequests} {
+			client, _ := newTestClient(t, stubStatus(status, "<html>nope</html>"))
+			client.requestLimiter().maxRetries = 0
+			for name, call := range strictCalls() {
+				err := call(client)
+				expectHTTPStatus(t, err, status)
+				if errors.Is(err, ErrUnexpectedResponse) {
+					t.Fatalf("%s, HTTP %d: до API запрос не дошёл, ErrUnexpectedResponse тут лишняя: %v", name, status, err)
+				}
+			}
+		}
+	})
+
+	t.Run("success is a success", func(t *testing.T) {
+		client, _ := newTestClient(t, stubStatus(200, okEnvelope))
+		for name, call := range strictCalls() {
+			if err := call(client); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+	})
+}
+
+// Чтения, calc и выгрузки разбираются как раньше: «нехватка средств» у calc — status="error" с
+// data и пустым errors[] — по-прежнему отдаёт data без ошибки, HTML 200 на чтении — прежняя ошибка
+// разбора, а выгрузка отдаёт тело как есть. Delete с not-found внутри успешного конверта — тоже как
+// раньше.
+func TestReadsAndCalcKeepTheLenientParsing(t *testing.T) {
+	warning := `{"status":"error","data":{"warning":"Insufficient funds. Total $2. Not enough $33.10","total":35.1},"errors":[]}`
+	client, _ := newTestClient(t, stubStatus(200, warning))
+	calcs := map[string]func() (map[string]interface{}, error){
+		"CalculateOrder": func() (map[string]interface{}, error) {
+			return client.CalculateOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb"})
+		},
+		"OrderCalcIpv4": func() (map[string]interface{}, error) { return client.OrderCalcIpv4("USA", "1m", 1, "", "", "seo") },
+		"CalculateProlong": func() (map[string]interface{}, error) {
+			return client.CalculateProlong("ipv4", ProlongRequest{IDs: []string{testProxyID}, PeriodID: "1m"})
+		},
+		"ProlongCalc": func() (map[string]interface{}, error) {
+			return client.ProlongCalc("ipv4", []string{testProxyID}, "1m", "")
+		},
+		"CalculateAutoProlong": func() (map[string]interface{}, error) {
+			return client.CalculateAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{
+				IDs: []string{testProxyID}, PeriodID: "1m", PaymentID: "balance"}})
+		},
+		"ListOrders (a read)": func() (map[string]interface{}, error) { return client.ListOrders(OrderListOptions{}) },
+	}
+	for name, calc := range calcs {
+		data, err := calc()
+		if err != nil || data["warning"] != "Insufficient funds. Total $2. Not enough $33.10" {
+			t.Fatalf("%s: нехватка средств обязана отдавать data без ошибки, получено %#v / %v", name, data, err)
+		}
+	}
+
+	html := "<!DOCTYPE html><html><body>SPA</body></html>"
+	client, _ = newTestClient(t, stubStatus(200, html))
+	_, err := client.Balance()
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) || errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("HTML 200 на чтении — прежняя ошибка разбора, получено %T: %v", err, err)
+	}
+	if file, err := client.DownloadProxies("ipv4", ProxyDownloadOptions{Ext: "txt"}); err != nil || string(file) != html {
+		t.Fatalf("выгрузка отдаёт тело как есть, получено %q / %v", file, err)
+	}
+
+	client, _ = newTestClient(t, stubStatus(200, `{"status":"success","data":"{\"status\":\"not-found\"}","errors":[]}`))
+	if got, err := client.ResidentsubuserListDelete("f9ea7063d7a699b12b3e", "123"); err != nil || got["status"] != "not-found" {
+		t.Fatalf("not-found внутри успешного конверта разбирается как раньше, получено %#v / %v", got, err)
+	}
+}
+
+/////////////////////////////// Таймаут денежных вызовов (F5) ///////////////////////////////
+
+// timeoutsOf — таймаут обычного и денежного запроса клиента, как их применит doWithHeaders.
+func timeoutsOf(t *testing.T, c *Client) (general, money time.Duration) {
+	t.Helper()
+	_, _, httpClient, err := c.snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	return httpClient.Timeout, c.moneyHTTPClient(httpClient).Timeout
+}
+
+// countingTransport считает запросы и отдаёт их http.DefaultTransport.
+type countingTransport struct{ calls int32 }
+
+func (c *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&c.calls, 1)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Денежный запрос ждёт max(общий таймаут, money-таймаут), по умолчанию 30 и 120 с. WithMoneyTimeout(0)
+// отключает отдельный таймаут. Пользовательский *http.Client не меняется: для денежного запроса
+// берётся его копия с тем же Transport, Jar и CheckRedirect, а клиент без таймаута так и остаётся без него.
+func TestMoneyTimeoutDefaultsAndOptions(t *testing.T) {
+	zero := &Client{}
+	zero.SetAPIKey("k")
+	cases := []struct {
+		name           string
+		client         *Client
+		general, money time.Duration
+	}{
+		{"NewClient", NewClient("k"), 30 * time.Second, 120 * time.Second},
+		{"a Client not made by NewClient", zero, 30 * time.Second, 120 * time.Second},
+		{"a shorter WithTimeout", NewClient("k", WithTimeout(15*time.Second)), 15 * time.Second, 120 * time.Second},
+		{"a longer WithTimeout wins", NewClient("k", WithTimeout(5*time.Minute)), 5 * time.Minute, 5 * time.Minute},
+		{"WithMoneyTimeout", NewClient("k", WithMoneyTimeout(time.Minute)), 30 * time.Second, time.Minute},
+		{"WithMoneyTimeout below WithTimeout", NewClient("k", WithMoneyTimeout(10*time.Second)), 30 * time.Second, 30 * time.Second},
+		{"WithMoneyTimeout(0) turns it off", NewClient("k", WithMoneyTimeout(0)), 30 * time.Second, 30 * time.Second},
+		{"a negative WithMoneyTimeout too", NewClient("k", WithMoneyTimeout(-time.Second)), 30 * time.Second, 30 * time.Second},
+		{"WithHTTPClient", NewClient("k", WithHTTPClient(&http.Client{Timeout: 45 * time.Second})), 45 * time.Second, 120 * time.Second},
+		{"WithHTTPClient without a timeout", NewClient("k", WithHTTPClient(&http.Client{})), 0, 0},
+	}
+	for _, tc := range cases {
+		if general, money := timeoutsOf(t, tc.client); general != tc.general || money != tc.money {
+			t.Errorf("%s: timeouts %v / %v, want %v / %v", tc.name, general, money, tc.general, tc.money)
+		}
+	}
+	if DefaultClient.moneyTimeout != defaultMoneyTimeout {
+		t.Fatalf("DefaultClient: money timeout %v, want %v", DefaultClient.moneyTimeout, defaultMoneyTimeout)
+	}
+
+	transport := &countingTransport{}
+	jar, _ := cookiejar.New(nil)
+	checkRedirect := func(*http.Request, []*http.Request) error { return nil }
+	user := &http.Client{Timeout: 10 * time.Second, Transport: transport, Jar: jar, CheckRedirect: checkRedirect}
+	client := NewClient("k", WithHTTPClient(user))
+	_, _, used, _ := client.snapshot()
+	money := client.moneyHTTPClient(used)
+	if used != user || user.Timeout != 10*time.Second {
+		t.Fatalf("пользовательский клиент изменён: %#v", user)
+	}
+	if money == user || money.Timeout != 120*time.Second || money.Transport != transport || money.Jar != jar ||
+		reflect.ValueOf(money.CheckRedirect).Pointer() != reflect.ValueOf(checkRedirect).Pointer() {
+		t.Fatalf("денежный запрос должен идти через копию с тем же Transport, Jar и CheckRedirect: %#v", money)
+	}
+}
+
+// Денежный запрос не обрезается общим таймаутом, остальные — обрезаются, как раньше. Сервер
+// отвечает за 400 мс, общий таймаут — 150 мс, денежный — 5 с.
+func TestMoneyCallsOutliveTheClientTimeout(t *testing.T) {
+	const delay, short = 400 * time.Millisecond, 150 * time.Millisecond
+	slow := func(w http.ResponseWriter, r *http.Request, n int) {
+		time.Sleep(delay)
+		writeStubResponse(w, http.StatusOK, okEnvelope)
+	}
+	expectTimeout := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if !os.IsTimeout(err) {
+			t.Fatalf("%s: ожидался таймаут, получено %v", what, err)
+		}
+		if strings.Contains(err.Error(), "test-key") {
+			t.Fatalf("%s: ключ в тексте ошибки: %v", what, err)
+		}
+	}
+
+	client, _, _ := newPacedClient(t, slow, WithTimeout(short), WithMoneyTimeout(5*time.Second))
+	ok := noErr(t)
+	ok(client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"}))
+	ok(client.AddBalance(10, testProxyID))
+	ok(client.ProlongMake("ipv4", []string{testProxyID}, "1m", ""))
+	_, err := client.Balance()
+	expectTimeout(t, "чтение", err)
+	_, err = client.SetProxyComment([]string{testProxyID}, "note")
+	expectTimeout(t, "запись", err)
+
+	// Пользовательский клиент: денежный запрос идёт через его Transport, сам клиент не меняется.
+	transport := &countingTransport{}
+	user := &http.Client{Timeout: short, Transport: transport}
+	client, _, _ = newPacedClient(t, slow, WithHTTPClient(user), WithMoneyTimeout(5*time.Second))
+	ok(client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"}))
+	_, err = client.Balance()
+	expectTimeout(t, "чтение через пользовательский клиент", err)
+	if got := atomic.LoadInt32(&transport.calls); got != 2 || user.Timeout != short {
+		t.Fatalf("оба запроса должны пройти через Transport пользователя (%d), его Timeout — остаться %v (%v)", got, short, user.Timeout)
+	}
+
+	// WithMoneyTimeout(0): денежный запрос ждёт столько же, сколько любой другой.
+	client, _, _ = newPacedClient(t, slow, WithTimeout(short), WithMoneyTimeout(0))
+	_, err = client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+	expectTimeout(t, "order/make с WithMoneyTimeout(0)", err)
+}
+
+/////////////////////////////// DefaultClient и пакетные функции (F6) ///////////////////////////////
+
+// loopbackOnly пускает запросы только на локальный стенд: тест подменяет DefaultClient и URL, и
+// ошибка в этой логике не должна увести запрос на прод даже с ключом-заглушкой.
+type loopbackOnly struct{}
+
+func (loopbackOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	if host := r.URL.Hostname(); host != "127.0.0.1" && host != "::1" && host != "localhost" {
+		return nil, fmt.Errorf("test transport refuses a request to %s", host)
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// DefaultClient, заменённый на NewClient(key, WithBaseURL(mock)), как советует README, обслуживает
+// пакетные функции по своему адресу: раньше legacyClient на каждом вызове сбрасывал его на URL, а
+// URL по умолчанию — прод. URL подменяет адрес, только пока отличается от DefaultBaseURL; вернули
+// её к умолчанию (или очистили) — клиент снова ходит по своему адресу, в том числе по заданному
+// SetBaseURL во время подмены.
+func TestPackageFunctionsHonorAReplacedDefaultClient(t *testing.T) {
+	oldDefault, oldURL := DefaultClient, URL
+	t.Cleanup(func() { DefaultClient, URL = oldDefault, oldURL })
+	stub := func() (string, *int32) {
+		hits := new(int32)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			writeStubResponse(w, http.StatusOK, okEnvelope)
+		}))
+		t.Cleanup(server.Close)
+		return server.URL + "/personal/api/v2/", hits
+	}
+	mockURL, mockHits := stub()
+	otherURL, otherHits := stub()
+	thirdURL, thirdHits := stub()
+	expectHits := func(what string, want ...int32) {
+		t.Helper()
+		got := []int32{atomic.LoadInt32(mockHits), atomic.LoadInt32(otherHits), atomic.LoadInt32(thirdHits)}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: mock/other/third получили %v, ожидалось %v", what, got, want)
+		}
+	}
+	balance := func() {
+		t.Helper()
+		if _, err := BalanceE(); err != nil {
+			t.Fatalf("BalanceE: %v", err)
+		}
+	}
+
+	URL = DefaultBaseURL
+	DefaultClient = NewClient("test-key", WithBaseURL(mockURL), WithHTTPClient(&http.Client{Transport: loopbackOnly{}}))
+	useFakeClock(DefaultClient, newFakeClock())
+	SetPaymentCode("balance")
+	balance()
+	if _, err := OrderMakeIpv4("USA", "1m", 1, "", "", "seo"); err != nil {
+		t.Fatalf("OrderMakeIpv4: %v", err)
+	}
+	expectHits("заменённый DefaultClient", 2, 0, 0)
+
+	URL = otherURL
+	balance()
+	expectHits("URL изменён", 2, 1, 0)
+	URL = DefaultBaseURL
+	balance()
+	expectHits("URL вернули к умолчанию", 3, 1, 0)
+	URL = otherURL
+	balance()
+	URL = ""
+	balance()
+	expectHits("URL очищен", 4, 2, 0)
+
+	URL = otherURL
+	balance() // подмена действует
+	DefaultClient.SetBaseURL(thirdURL)
+	balance()
+	expectHits("SetBaseURL во время подмены: URL всё ещё главнее", 4, 4, 0)
+	URL = DefaultBaseURL
+	balance()
+	expectHits("после подмены — адрес из SetBaseURL, а не прежний", 4, 4, 1)
+}
+
+// Пакетные сеттеры состояния и URL помечены Deprecated со ссылкой на NewClient — все пакетные Set*,
+// включая будущие.
+func TestPackageLevelSettersAreDeprecated(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "sdk.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse sdk.go: %v", err)
+	}
+	docs := map[string]string{}
+	var setters []string
+	for _, decl := range file.Decls {
+		switch declaration := decl.(type) {
+		case *ast.FuncDecl:
+			if declaration.Recv != nil {
+				continue
+			}
+			if strings.HasPrefix(declaration.Name.Name, "Set") {
+				setters = append(setters, declaration.Name.Name)
+			}
+			if declaration.Doc != nil {
+				docs[declaration.Name.Name] = declaration.Doc.Text()
+			}
+		case *ast.GenDecl:
+			for _, spec := range declaration.Specs {
+				value, isValue := spec.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				doc := value.Doc
+				if doc == nil {
+					doc = declaration.Doc
+				}
+				for _, name := range value.Names {
+					if doc != nil {
+						docs[name.Name] = doc.Text()
+					}
+				}
+			}
+		}
+	}
+	want := []string{"SetApiKey", "SetPaymentId", "SetPaymentCode", "SetGenerateAuth", "SetFingerprint"}
+	if !reflect.DeepEqual(setters, want) {
+		t.Fatalf("пакетные Set* = %v, ожидались %v: новый сеттер тоже должен получить Deprecated", setters, want)
+	}
+	for _, name := range append(want, "URL") {
+		doc := docs[name]
+		at := strings.Index("\n"+doc, "\nDeprecated: ")
+		if at < 0 || !strings.Contains(doc[at:], "NewClient") {
+			t.Errorf("%s: нет абзаца \"Deprecated: ...\" со ссылкой на NewClient:\n%s", name, doc)
+		}
+	}
+}
+
+/////////////////////////////// F1 и F2 не сломаны ///////////////////////////////
+
+// Транспорт Go не переотправляет POST без Idempotency-Key, и копия http-клиента для денежного
+// запроса (F5) этого не меняет: соединение из пула оборвалось после того, как сервер прочитал
+// order/make, — запрос пришёл ровно один раз, а вызов вернул ошибку без ключа.
+func TestMoneyCallIsNotReplayedAfterADroppedConnection(t *testing.T) {
+	var orders int32
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/order/make") {
+			writeStubResponse(w, http.StatusOK, okEnvelope)
+			return
+		}
+		atomic.AddInt32(&orders, 1)
+		_, _ = io.ReadAll(r.Body)
+		hijacker, isHijacker := w.(http.Hijacker)
+		if !isHijacker {
+			t.Error("the stub cannot hijack the connection")
+			return
+		}
+		if conn, _, err := hijacker.Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	})
+	noErr(t)(client.Balance()) // соединение остаётся в пуле keep-alive
+	_, err := client.MakeOrder(OrderRequest{SectionCode: "resident", TarifID: "1-gb", PaymentCode: "balance"})
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || strings.Contains(err.Error(), "test-key") {
+		t.Fatalf("ожидалась *url.Error без ключа, получено %T: %v", err, err)
+	}
+	if got := atomic.LoadInt32(&orders); got != 1 {
+		t.Fatalf("order/make пришёл %d раз, ожидался ровно один", got)
+	}
+}
+
+// Платёжка из вызова главнее платёжки клиента: клиентская пара (SetPaymentCode / SetPaymentID)
+// подмешивается, только когда в вызове нет ни id, ни кода.
+func TestCallPaymentOutranksClientPayment(t *testing.T) {
+	var body string
+	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"ok":true,"url":"https://pay"},"errors":[]}`, &body))
+	order := OrderRequest{SectionCode: "resident", TarifID: "1-gb"}
+	prolong := ProlongRequest{IDs: []string{testProxyID}, PeriodID: "1m"}
+	calls := map[string]func(id, code string) error{
+		"CalculateOrder": func(id, code string) error {
+			request := order
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.CalculateOrder(request)
+			return err
+		},
+		"MakeOrder": func(id, code string) error {
+			request := order
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.MakeOrder(request)
+			return err
+		},
+		"CalculateProlong": func(id, code string) error {
+			request := prolong
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.CalculateProlong("ipv4", request)
+			return err
+		},
+		"MakeProlong": func(id, code string) error {
+			request := prolong
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.MakeProlong("ipv4", request)
+			return err
+		},
+		"CalculateAutoProlong": func(id, code string) error {
+			request := AutoProlongRequest{ProlongRequest: prolong}
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.CalculateAutoProlong("ipv4", request)
+			return err
+		},
+		"EnableAutoProlong": func(id, code string) error {
+			request := AutoProlongRequest{ProlongRequest: prolong}
+			request.PaymentID, request.PaymentCode = id, code
+			_, err := client.EnableAutoProlong("ipv4", request)
+			return err
+		},
+	}
+	payment := func() (interface{}, interface{}) {
+		var sent map[string]interface{}
+		if err := json.Unmarshal([]byte(body), &sent); err != nil {
+			t.Fatalf("тело %q: %v", body, err)
+		}
+		return sent["paymentId"], sent["paymentCode"]
+	}
+	for name, call := range calls {
+		client.SetPaymentCode("paddle_subscription")
+		if err := call("balance", ""); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if id, code := payment(); id != "balance" || code != nil {
+			t.Fatalf("%s: клиентский код + paymentId вызова: ушло paymentId=%v paymentCode=%v", name, id, code)
+		}
+		client.SetPaymentID("balance")
+		if err := call("", "paddle_subscription"); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if id, code := payment(); id != nil || code != "paddle_subscription" {
+			t.Fatalf("%s: клиентский id + paymentCode вызова: ушло paymentId=%v paymentCode=%v", name, id, code)
+		}
+	}
+
+	client.SetPaymentID("68b1f0c4e13a4c0f1a2b3c4d")
+	if _, err := client.AddBalance(10, "68b1f0c4e13a4c0f1a2b3c51"); err != nil {
+		t.Fatalf("AddBalance: %v", err)
+	}
+	if id, code := payment(); id != "68b1f0c4e13a4c0f1a2b3c51" || code != nil {
+		t.Fatalf("AddBalance: paymentId вызова должен быть главнее клиентского, ушло %v / %v", id, code)
 	}
 }

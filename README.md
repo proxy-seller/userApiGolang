@@ -56,7 +56,7 @@ func main() {
 }
 ```
 
-Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by default. `WithTimeout` defaults to 30 seconds. Requests are paced by default — see [Rate limits and the request queue](#rate-limits-and-the-request-queue).
+Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by default. `WithTimeout` defaults to 30 seconds; money calls (`order/make`, `prolong/make/{type}`, `balance/add`) get 120 seconds — see [Timeouts and retries on payments](#timeouts-and-retries-on-payments). Requests are paced by default — see [Rate limits and the request queue](#rate-limits-and-the-request-queue).
 
 ### Paying for orders
 
@@ -90,7 +90,7 @@ Any string is accepted — the server does not validate its shape — but keep i
 client := api.NewClient("YOUR_API_KEY", api.WithBaseURL("http://localhost:7995/personal/api/v2/"))
 ```
 
-`WithHTTPClient` accepts an injected `*http.Client` (custom transport, TLS, tracing, local stubs). The base URL must include `/personal/api/v2/`.
+`WithHTTPClient` accepts an injected `*http.Client` (custom transport, TLS, tracing, local stubs). The SDK never modifies it — money calls go through a copy with a longer timeout, see [Timeouts and retries on payments](#timeouts-and-retries-on-payments). The base URL must include `/personal/api/v2/`.
 
 </details>
 
@@ -102,7 +102,9 @@ api.SetPaymentCode("balance") // orders and renewals: "balance" or "paddle_subsc
 fmt.Println(api.Balance())
 ```
 
-`URL` is retained for old callers, but new code should use `WithBaseURL`.
+> ⚠️ **The package-level API keeps one state for the whole process.** `SetApiKey`, `SetPaymentId`, `SetPaymentCode`, `SetGenerateAuth` and `SetFingerprint` are deprecated: they change `DefaultClient`, which every goroutine and every package of the program shares. Two callers with different keys or payment codes overwrite each other, and an order goes out with the other caller's key or is paid the other caller's way. Use `NewClient` — one client per key — and pass per-call values (`OrderRequest.PaymentCode`, `ProlongRequest.PaymentCode`, `OrderRequest.Fingerprint`, `OrderRequest.GenerateAuth`) instead of changing a shared client between calls: its setters have the same effect on everyone who uses it.
+
+`URL` is retained for old callers and deprecated as well — new code should use `WithBaseURL`. While `URL` differs from `DefaultBaseURL`, it overrides the base URL of `DefaultClient` for the package-level functions; at its default value it leaves `DefaultClient` alone, so a replacement such as `api.DefaultClient = api.NewClient(key, api.WithBaseURL("http://localhost:7995/personal/api/v2/"))` is honored. Set `URL` back to `DefaultBaseURL` and `DefaultClient` gets its own base URL back.
 
 ## All ids in v2 are strings
 
@@ -128,7 +130,7 @@ Two documented exceptions:
 
 ## Error handling
 
-The envelope is `{status, data, errors}` and the HTTP status is **almost always 200** — failures live inside `errors[]`. Non-2xx statuses come only from the plain-text `ext` rejection described below and from the edge rate limit in front of the API (HTTP 429), which the client retries by itself — see [Rate limits and the request queue](#rate-limits-and-the-request-queue).
+The envelope is `{status, data, errors}` and the HTTP status is **almost always 200** — failures live inside `errors[]`. The API itself answers non-2xx only with the plain-text `ext` rejection described below. What sits in front of it can answer otherwise: the edge rate limit answers HTTP 429, which the client retries by itself (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)), and a gateway or the front-end can answer HTTP 5xx or 404 with an HTML page. Such replies come back as an `*APIError` with `HTTPStatus` and the start of the page in `Body`; on a money call they leave the outcome unknown — see [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
 
 ```go
 _, err := client.ProxyReplace(ids, api.ProxyReplaceReasonCustom, "manual reason")
@@ -146,7 +148,9 @@ if errors.As(err, &apiErr) {
 - **Access errors always arrive as the same triple.** A broken key, an IP outside the allowlist and an exceeded rate limit all return HTTP 200 with three errors, all `code: 503`:
   `"Error api key"`, `"IP not allowed <ip>"`, `"Request limit reached"`.
   `errors[0].message` is therefore always `"Error api key"` — it does **not** identify the actual cause. Inspect the whole slice. The API itself never answers HTTP 429: going over its limit of 1000 requests per calendar minute per key produces this triple too. The client paces its requests to stay under that limit and never retries the triple (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)).
-- A response with useful `data` and an empty `errors` array is returned as success with `ResultData.Status == "error"` (server-side warnings, e.g. `order/calc` with insufficient funds).
+- **Reads** return a response with useful `data` and an empty `errors` array as success with `ResultData.Status == "error"` (server-side warnings: `order/calc`, `prolong/calc` and `autoprolong/calc` with insufficient funds).
+- **Money and write calls** (the kinds in [Rate limits and the request queue](#rate-limits-and-the-request-queue)) succeed only on `status: "success"`. `status: "error"` is an `*APIError` there even with `data` and an empty `errors[]` — the data stays in `APIError.Data`, and its `warning` becomes the text of the error. A reply without the JSON envelope — an HTML page, an empty body, `204`, a non-object or truncated JSON with a 2xx status, or an HTTP 5xx page — is an `*APIError` for which `errors.Is(err, api.ErrUnexpectedResponse)` holds: the request may have been executed, so check before retrying (see [Timeouts and retries on payments](#timeouts-and-retries-on-payments)). Reads, the `*/calc` endpoints and downloads are parsed as before.
+- **Errors never carry the API key.** The key sits in the URL path, and its echo comes back in transport errors (`*url.Error` holds the full URL), in error pages and bodies (a front-end 404 page repeats the path in lower case, a Spring error body has it in `path`) and in redirects. Everywhere the SDK hands an error over — `*url.Error.URL`, `APIError.Body`, the messages, `data` and `customData` — the key is replaced with `***`, in any letter case and URL-encoded too. A wrapped transport error whose text quotes the key is replaced with one that has the same text without the key and still reports `Timeout()` and matches `context.DeadlineExceeded` / `context.Canceled`; the raw error is not reachable through `errors.Unwrap`. `APIError.Body` of a reply without the envelope keeps at most 500 characters, and `fmt` prints a `*Client` with `apiKey: "***"`.
 - Validation limits are carried in `errors[].customData`; `AutoTopupLimitsFromError` unpacks the auto top-up ones.
 
 ## Rate limits and the request queue
@@ -169,7 +173,7 @@ The kind of a request is decided by its path alone — also for calls made throu
 | write | `autoprolong/enable/{type}`, `autoprolong/disable/{type}`, `auth/add`, `auth/add/ip`, `auth/change`, `auth/delete`, `proxy/replace`, `proxy/comment/set`, `balance/autotopup/set`, `resident/list` (the POST alias of `resident/list/add`), `resident/list/add`, `resident/list/delete`, `resident/list/rename`, `resident/list/rotation`, `resident/list/tools`, `residentsubuser/create`, `residentsubuser/update`, `residentsubuser/delete`, `residentsubuser/list/add`, `residentsubuser/list/delete`, `residentsubuser/list/rename`, `residentsubuser/list/rotation`, `residentsubuser/list/tools` |
 | read | everything else: `*/list`, `*/get`, every `*/calc` (`order/calc`, `prolong/calc/{type}` and `autoprolong/calc/{type}` are POST but change nothing), `reference/*`, `proxy/download/*`, `resident/package`, `resident/lists`, `resident/geo*`, `resident/consumption`, `resident/traffic/details`, `residentsubuser/packages`, `residentsubuser/lists`, `balance/payments/list`, `balance/autotopup/get` |
 
-A `Client` is safe for concurrent use. Waiting blocks the calling goroutine (it sleeps, it does not spin) and happens before the request is sent, so it does not count against `WithTimeout`.
+A `Client` is safe for concurrent use. Waiting blocks the calling goroutine (it sleeps, it does not spin) and happens before the request is sent, so it does not count against `WithTimeout` or `WithMoneyTimeout`.
 
 ### Changing or turning it off
 
@@ -192,11 +196,55 @@ unpaced := api.NewClient("YOUR_API_KEY", api.WithRateLimit(false)) // the previo
 | `WithMoneyInterval(d)` | `2s` | between the starts of two money requests |
 | `WithMaxRetries(n)` | `3` | retries after HTTP 429; `0` turns them off |
 
-The package-level functions use `DefaultClient`, which is paced with the defaults. To configure it, replace it before the first call: `api.DefaultClient = api.NewClient("YOUR_API_KEY", api.WithRateLimit(false))`.
+The package-level functions use `DefaultClient`, which is paced with the defaults. To configure it, replace it before the first call: `api.DefaultClient = api.NewClient("YOUR_API_KEY", api.WithRateLimit(false))` — the replacement keeps its own base URL, see [Client configuration](#client-configuration).
 
 ### One client per key
 
 The window and the queue live in the `Client` instance. Clients — or processes — that share an API key do not know about each other: each keeps its own window and its own queue, so together they can still go over the limits. Create one `Client` per key and share it between goroutines. When several processes or machines work with one key anyway, the server can still answer code 57 (two renewals of the same order at once) or the access-denied triple (the key went over its limit) — handle them as before.
+
+## Timeouts and retries on payments
+
+Money calls — `order/make` (`MakeOrder`, `OrderMake*`), `prolong/make/{type}` (`MakeProlong`, `ProlongMake`) and `balance/add` (`AddBalance`, `BalanceAdd*`) — have a timeout of their own, **120 s** by default; every other call keeps `WithTimeout` (30 s). The server processes an order synchronously — a large MIX order takes about a second per country — and a money call the client gave up on is still an order that was created and paid.
+
+```go
+client := api.NewClient("YOUR_API_KEY",
+    api.WithTimeout(15*time.Second),     // reads and writes
+    api.WithMoneyTimeout(3*time.Minute), // money calls; default 120 s
+)
+```
+
+- A money call waits for the longer of `WithTimeout` and `WithMoneyTimeout`, so a longer `WithTimeout` is never shortened. `WithMoneyTimeout(0)` turns the separate timeout off: money calls then wait as long as any other call.
+- With `WithHTTPClient` your `*http.Client` is never modified. A money call goes through a copy of it with the longer `Timeout` and the same `Transport` (and connection pool), `Jar` and `CheckRedirect`. The timeouts of the `Transport` itself (`ResponseHeaderTimeout` and the like) still apply, and a client with `Timeout: 0` (no timeout) stays without one.
+- Time spent waiting in the queue does not count against either timeout: the request has not been sent yet.
+
+**A failed money call does not mean that nothing happened.** After a timeout, a dropped connection, an HTTP 5xx or a reply without the JSON envelope, the outcome is unknown: the order may have been created and paid, the renewal may have gone through, a payment link may have been issued. The SDK never repeats these calls by itself — the one exception is HTTP 429 from the edge rate limit, which never reached the API. Look before you call again:
+
+| Call | Check first |
+|---|---|
+| `order/make` | `ListOrders` — the newest orders (`SortBy: "date_insert", Order: "desc"`) |
+| `prolong/make/{type}` | `ListProxies` (the `date_end` of the proxies) or `ListOrders` with `IsExtend: "Y"` |
+| `balance/add` | `Balance` and your payment history |
+
+What such a failure looks like:
+
+| Failure | Error |
+|---|---|
+| timeout | `*url.Error`; `os.IsTimeout(err)` is true |
+| dropped connection, DNS, TLS | `*url.Error` |
+| a reply without the JSON envelope: an HTML page, an empty body or truncated JSON with a 2xx status, or an HTTP 5xx page | `*api.APIError` with `errors.Is(err, api.ErrUnexpectedResponse)`, the `HTTPStatus` and the start of the reply in `Body` |
+| HTTP 5xx with the envelope | `*api.APIError` with `HTTPStatus >= 500` |
+
+```go
+_, err := client.MakeOrder(order)
+var urlErr *url.Error
+var apiErr *api.APIError
+if errors.As(err, &urlErr) || errors.Is(err, api.ErrUnexpectedResponse) ||
+    (errors.As(err, &apiErr) && apiErr.HTTPStatus >= 500) {
+    // the outcome is unknown: look the order up in ListOrders before placing it again
+}
+```
+
+None of these errors contains the API key — see [Error handling](#error-handling).
 
 ## Balance and auto top-up
 
@@ -467,6 +515,12 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 
 ### v2.0.1 — catching up with the server
 
+- **Errors no longer carry the API key.** A transport error (`*url.Error`: port closed, timeout, dropped connection, redirect) used to be returned as is, with the full URL — key included — in its text, and `APIError.Body` kept error pages that echo the path. The key is now replaced with `***`, in any letter case and URL-encoded too, in `*url.Error.URL`, `APIError.Body`, the messages, `data` and `customData`; a wrapped transport error that quotes the key is replaced by one without it that keeps `Timeout()` and matches the same context errors. `fmt` prints a `*Client` with `apiKey: "***"`. `APIError.Body` of a reply without the JSON envelope keeps at most 500 characters.
+- **Behaviour change: money and write calls succeed only on `status: "success"`.** `status: "error"` with `data` and an empty `errors[]` used to pass as a success on every route; it stays one only on reads (the `*/calc` endpoints with insufficient funds) and is an `*APIError` on make and write calls, with `data.warning` as its text. A reply without the JSON envelope on these calls — HTML, an empty body, `204`, a non-object or truncated JSON with a 2xx status, or an HTTP 5xx page — used to surface as a bare `*json.SyntaxError` (or a plain `client api HTTP 502`); it is now an `*APIError` for which `errors.Is(err, ErrUnexpectedResponse)` holds, with the text `unexpected response (no JSON envelope): the request may have been executed, check before retrying`. Added `ErrUnexpectedResponse` and `APIError.Unwrap`. Reads, `*/calc` and downloads are unchanged.
+- **Money calls get their own timeout, 120 s by default** (`WithMoneyTimeout`); every other call keeps 30 s. A money call waits for the longer of the two, and the `*http.Client` of `WithHTTPClient` is not modified — the money call goes through a copy with the longer `Timeout`. New section [Timeouts and retries on payments](#timeouts-and-retries-on-payments): a timeout, a dropped connection, a 5xx or a reply without the envelope on `order/make`, `prolong/make` or `balance/add` leaves the outcome unknown — check `ListOrders`, `ListProxies` or `Balance` before calling again.
+- **Fixed: a replaced `DefaultClient` was sent to production.** Every package-level call reset the base URL of `DefaultClient` to `URL`, whose default value is the production URL, so `api.DefaultClient = api.NewClient(key, api.WithBaseURL(mock))` was ignored by the package-level functions, `OrderMake*` included. `URL` now overrides `DefaultClient` only while it differs from `DefaultBaseURL`, and setting it back restores the client's own base URL.
+- **Deprecated:** the package-level setters `SetApiKey`, `SetPaymentId`, `SetPaymentCode`, `SetGenerateAuth`, `SetFingerprint` and the variable `URL`. The package-level API keeps one state for the whole process — use `NewClient`.
+- README: corrected [Error handling](#error-handling), which claimed that non-2xx statuses come only from the `ext` rejection and the edge 429 — gateways and the front-end answer 5xx and 404 pages too.
 - **Behaviour change (server side): `ListProxies` filters.** `Latest: "Y"` now means the latest order of the requested type (of the MIX orders for `mix` / `mix_isp`) instead of the latest order of the whole account, which left the list empty whenever another type had been bought last; without a type it is still one latest order for the whole response, and it no longer empties `resident` and `scraper`. `OrderID` also accepts the numeric `id` of a `ListOrders` row, `base_order_number` and an earlier `order_number` of a renewed order, not only `order_id` and the exact current `order_number`. No SDK code changed — both values go to the server as they are.
 - **Behaviour change: requests are now paced by default** (see [Rate limits and the request queue](#rate-limits-and-the-request-queue)). All requests share a sliding window of 1000 starts within any 60 s; write and money requests run one at a time through a queue, at least 1 s apart (money requests at least 2 s apart); HTTP 429 from the edge rate limit is retried after `Retry-After`, up to 3 times. Code 57 and the access-denied triple are returned as before and never retried. New options `WithRateLimit`, `WithRequestsPerMinute`, `WithWriteInterval`, `WithMoneyInterval` and `WithMaxRetries`; `WithRateLimit(false)` restores the previous behaviour exactly.
 - **Breaking — renewal selection follows the server.** `ProlongRequest.OrderSeparatorIDs` / `OrderSeparatorID` (`orderSeparatorIds` / `orderSeparatorId`) are removed — the server dropped both; use `OrderIDs`. `IDs` (`ids`) and `IPs` (`ips`) now apply to `ipv4`, `isp` and `mobile` only: for `ipv6`, `mix` and `mix_isp` the server refuses them. `AutoProlongRequest` embeds `ProlongRequest`, so the same applies to `autoprolong/*`.
