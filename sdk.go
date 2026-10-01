@@ -2936,9 +2936,12 @@ const (
 // не передаёт в расчёт, чтобы превью не показало цену, которой в день списания не будет.
 type AutoProlongRequest struct {
 	ProlongRequest
-	// SubscriptionID — подписка Paddle, которой списывать. Обязательна и осмысленна ТОЛЬКО
-	// когда платёжка резолвится в paddle_subscription; для balance игнорируется. Подписка
-	// должна принадлежать этому же аккаунту, иначе "Set existed [subscriptionId] from reference".
+	// SubscriptionID — подписка Paddle (привязанная карта), которой списывать. Осмысленна ТОЛЬКО
+	// когда платёжка резолвится в paddle_subscription; для balance игнорируется. Пока карта на
+	// аккаунте одна, поле можно не слать — сервер спишет с неё; при нескольких картах оно
+	// обязательно ("Set [subscriptionId]"), а без карты сервер отвечает "No saved card on the
+	// account: add a card in your account or use [paymentId] balance". Подписка должна
+	// принадлежать этому же аккаунту, иначе "Set existed [subscriptionId] from reference".
 	SubscriptionID string `json:"subscriptionId,omitempty"`
 	// TarifID — только резидентская ветка (type = resident); у обычных прокси вместо него
 	// PeriodID. Автопродление тариф не меняет, поэтому единственное принимаемое значение —
@@ -2961,7 +2964,8 @@ type AutoProlongRequest struct {
 //
 // Список допустимых платёжек локально НЕ сверяется: значение может быть и ObjectId, и кодом
 // самой системы, который не обязан совпадать с именем типа, — такую проверку честно делает
-// только сервер. Проверяем отсутствие значения и подписку Paddle, когда тип назван явно.
+// только сервер. Проверяем только отсутствие значения. SubscriptionID тоже не спрашиваем: с одной
+// привязанной картой сервер берёт её сам, а сколько карт на аккаунте, видно только ему.
 //
 // Проверять нужно УЖЕ подготовленное тело: prepareProlong подставляет платёжку клиента
 // (SetPaymentId / SetPaymentCode), и на сыром request проверка отбивала бы запрос, который
@@ -2983,9 +2987,6 @@ func assertAutoProlong(proxyType string, request AutoProlongRequest, paymentRequ
 	}
 	if payment == "" {
 		return fmt.Errorf("autoprolong: paymentId is required (the server replies \"Set [paymentId]\"), the charge happens while you are not there; allowed systems are %s and %s", AutoProlongPaymentBalance, AutoProlongPaymentPaddleSubscription)
-	}
-	if payment == AutoProlongPaymentPaddleSubscription && strings.TrimSpace(request.SubscriptionID) == "" {
-		return fmt.Errorf("autoprolong: subscriptionId is required for %s (the server replies \"Set [subscriptionId]\"), take it from balance/autotopup/get -> paymentMethod.id", AutoProlongPaymentPaddleSubscription)
 	}
 	return nil
 }

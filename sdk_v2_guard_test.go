@@ -776,6 +776,52 @@ func TestAutoProlongResidentRefusesSelection(t *testing.T) {
 	}
 }
 
+// paddle_subscription без SubscriptionID уходит на сервер: с одной привязанной картой он берёт её
+// сам, а сколько карт на аккаунте, знает только он. Заданный SubscriptionID уходит как есть, а без
+// платёжки calc и enable по-прежнему отбиваются до запроса.
+func TestAutoProlongPaddleSubscriptionNeedsNoSubscriptionID(t *testing.T) {
+	var body string
+	client, _ := newTestClient(t, envelopeHandler(t, `{"status":"success","data":{"autoProlong":true},"errors":[]}`, &body))
+
+	request := AutoProlongRequest{ProlongRequest: ProlongRequest{IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PeriodID: "1m", PaymentID: AutoProlongPaymentPaddleSubscription}}
+	if _, err := client.EnableAutoProlong("ipv4", request); err != nil {
+		t.Fatalf("EnableAutoProlong(paddle_subscription) без SubscriptionID: %v", err)
+	}
+	if want := `{"ids":["68b1f0c4e13a4c0f1a2b3c4d"],"periodId":"1m","paymentId":"paddle_subscription"}`; body != want {
+		t.Fatalf("тело = %s, ожидалось %s", body, want)
+	}
+
+	client.SetPaymentCode(AutoProlongPaymentPaddleSubscription)
+	if _, err := client.CalculateAutoProlong("resident", AutoProlongRequest{}); err != nil {
+		t.Fatalf("CalculateAutoProlong(resident) с кодом paddle_subscription: %v", err)
+	}
+	if want := `{"paymentCode":"paddle_subscription"}`; body != want {
+		t.Fatalf("тело = %s, ожидалось %s", body, want)
+	}
+
+	request.SubscriptionID = "sub_1"
+	if _, err := client.EnableAutoProlong("ipv4", request); err != nil {
+		t.Fatalf("EnableAutoProlong с SubscriptionID: %v", err)
+	}
+	if !strings.Contains(body, `"subscriptionId":"sub_1"`) {
+		t.Fatalf("SubscriptionID потерялся: %s", body)
+	}
+
+	var requests int32
+	unpaid, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{},"errors":[]}`))
+	})
+	_, err := unpaid.EnableAutoProlong("ipv4", AutoProlongRequest{ProlongRequest: ProlongRequest{IDs: []string{"68b1f0c4e13a4c0f1a2b3c4d"}, PeriodID: "1m"}})
+	if err == nil || !strings.Contains(err.Error(), "paymentId is required") {
+		t.Fatalf("без платёжки ожидалась локальная ошибка, получено %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("без платёжки запрос не должен уходить, ушло %d", got)
+	}
+}
+
 // Тот же выбор на проводе: тело prolong/calc/ipv6 несёт orderIds, а не ids.
 func TestProlongCalcSendsOrderIDsForOrderTypes(t *testing.T) {
 	var body string
