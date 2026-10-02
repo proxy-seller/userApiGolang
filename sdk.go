@@ -1050,7 +1050,10 @@ func AuthChange(id string, active bool, login string, password string, ip string
 
 /////////////////////////////// Balance ///////////////////////////////
 
-// Balance Get balance statistic
+// Balance Get balance statistic.
+//
+// Deprecated: any error comes back as -1, so a failure looks like a balance. Use BalanceE or
+// (*Client).Balance, which return the error.
 func Balance() float64 {
 	value, err := legacyClient().Balance()
 	if err != nil {
@@ -1078,7 +1081,9 @@ func (c *Client) Balance() (float64, error) {
 //
 // paymentId — ObjectId string from balance/payments/list. paymentCode здесь НЕ работает:
 // balance/add принимает только id платёжной системы и код не резолвит (см. AddBalance).
-// Старая подпись глотает ошибку — используйте BalanceAddE.
+//
+// Deprecated: the error is dropped and a failure comes back as "". Use BalanceAddE or
+// (*Client).AddBalance, which return the error.
 func BalanceAdd(summ float64, paymentId string) string {
 	value, _ := legacyClient().AddBalance(summ, paymentId)
 	return value
@@ -2935,6 +2940,11 @@ type OrderRequest struct {
 	// CountryCode — alpha3, available from reference/list → country[].id.
 	CountryCode string `json:"countryCode,omitempty"`
 	// SectionCode — ipv4 | ipv6 | isp | mobile | mix | mix_isp | resident | scraper.
+	//
+	// Required: it is always sent, and an empty value is refused with
+	// "Set existed [sectionCode] from reference". The struct cannot tell "not set" from "", and
+	// the server deliberately refuses an empty section instead of guessing ipv4, so a forgotten
+	// section fails the call rather than buying another proxy type.
 	SectionCode string `json:"sectionCode"`
 	// PeriodID — ObjectId OR period code (lowercased by the server: "1m", "3m").
 	PeriodID string `json:"periodId,omitempty"`
@@ -2948,8 +2958,14 @@ type OrderRequest struct {
 	// does not list these: it is for AddBalance only.
 	PaymentID string `json:"paymentId,omitempty"`
 	// PaymentCode — payment code: "balance" or "paddle_subscription".
-	PaymentCode      string `json:"paymentCode,omitempty"`
-	Quantity         int    `json:"quantity,omitempty"`
+	PaymentCode string `json:"paymentCode,omitempty"`
+	// Quantity — number of proxies; for MIX one of reference/list/mix → quantities[].quantities.
+	//
+	// Always sent, 0 included: the server refuses 0 with "Set [quantity] more than 0" and treats
+	// only an ABSENT quantity as 1. Before v2.0.1 the field had omitempty, so Quantity: 0 (or a
+	// forgotten Quantity) was dropped and order/make bought one proxy. resident and scraper
+	// ignore the field.
+	Quantity         int    `json:"quantity"`
 	Authorization    string `json:"authorization,omitempty"`
 	CustomTargetName string `json:"customTargetName,omitempty"`
 	// MixID — ObjectId of the MIX package OR its tag; both come from reference/list/mix

@@ -7,21 +7,15 @@ Base URL: `https://proxy-seller.com/personal/api/v2/` — the API key is a **pat
 ## Install
 
 ```sh
-go get github.com/proxy-seller/userApiGolang/v2
+go get github.com/proxy-seller/userApiGolang/v2@latest
 ```
 
-> ⚠️ **This does not resolve yet.** The module path declares `/v2`, but the repository carries no
-> tags at all and the default branch (`main`) still declares the path without `/v2`, so the proxy
-> answers `no matching versions`. Until a `v2.x.x` tag is pushed on a branch whose `go.mod` says
-> `/v2`, depend on the branch explicitly — **keeping `/v2` in the path**:
->
-> ```sh
-> go get github.com/proxy-seller/userApiGolang/v2@feature/client-api-v2
-> ```
->
-> Dropping the `/v2` fails: the bare path and this branch's `go.mod` disagree, and the proxy
-> refuses with `go.mod has post-v0 module path ".../v2" at revision …`. With `/v2` it resolves
-> to the pseudo-version `v2.0.0-20260827082345-0949d38aa304`.
+```go
+import api "github.com/proxy-seller/userApiGolang/v2"
+```
+
+**Keep `/v2` in the path.** The bare `github.com/proxy-seller/userApiGolang` is the v1 module,
+the client for `/personal/api/v1/`, and none of this document applies to it.
 
 ## Client configuration
 
@@ -99,8 +93,10 @@ Every endpoint is available as a method on `*Client`. The old package-level API 
 ```go
 api.SetApiKey("YOUR_API_KEY")
 api.SetPaymentCode("balance") // orders and renewals: "balance" or "paddle_subscription"
-fmt.Println(api.Balance())
+balance, err := api.BalanceE()
 ```
+
+`Balance()` and `BalanceAdd()` keep their v1 signatures and are deprecated: they have no error result, so a failed call comes back as `-1` / `""`. Use `BalanceE()` / `BalanceAddE()` or the `*Client` methods.
 
 > ⚠️ **The package-level API keeps one state for the whole process.** `SetApiKey`, `SetPaymentId`, `SetPaymentCode`, `SetGenerateAuth` and `SetFingerprint` are deprecated: they change `DefaultClient`, which every goroutine and every package of the program shares. Two callers with different keys or payment codes overwrite each other, and an order goes out with the other caller's key or is paid the other caller's way. Use `NewClient` — one client per key — and pass per-call values (`OrderRequest.PaymentCode`, `ProlongRequest.PaymentCode`, `OrderRequest.Fingerprint`, `OrderRequest.GenerateAuth`) instead of changing a shared client between calls: its setters have the same effect on everyone who uses it.
 
@@ -501,7 +497,10 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 
 | v1 | v2 |
 |---|---|
+| `import "github.com/proxy-seller/userApiGolang"` | `import api "github.com/proxy-seller/userApiGolang/v2"` — a new module path, so the old one keeps resolving for v1 callers |
 | numeric ids (`orderId => 1000000`) | ObjectId strings (`orderId => "68b1f0c4e13a4c0f1a2b3c4d"`); resident list ids stay numeric |
+| `ProxyCheck`, `Ping` | removed, no v2 equivalent |
+| `Balance() float64`, `BalanceAdd(...) string` | kept in the v1 shape, without an error result (`paymentId` is a string now), and deprecated — a failure comes back as `-1` / `""`; use `BalanceE` / `BalanceAddE` or the `*Client` methods |
 | `targetId` + `targetSectionId` | `customTargetName` only |
 | `resident/lists` wrapped in `items` | flat array in `data` |
 | HTTP 429 on rate limit | HTTP 200 with the three-error access triple, `code: 503` |
@@ -513,7 +512,28 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 
 ## Changelog
 
-### v2.0.1 — catching up with the server
+The tag `v2.0.0` (2026-10-01) is the first release of the `/v2` module and contains both
+`v2.0.0` parts below. They were written while v2 was still in development, and part 2 was
+planned as v2.0.1 at the time; nothing was tagged in between.
+
+### v2.0.1 — 2026-10-02
+
+- **Fixed (money): `OrderRequest.Quantity` is always sent.** The field had `omitempty`, so
+  `Quantity: 0` — or a forgotten `Quantity` — was dropped, the server treated the missing
+  quantity as 1, and `MakeOrder` bought one proxy instead of being refused (`CalculateOrder`
+  quoted one). Now `0` reaches the server and is refused with `Set [quantity] more than 0`, like
+  in every other SDK and the raw API. `resident` and `scraper` ignore the field. **Behaviour
+  change:** a regular-section `MakeOrder` / `CalculateOrder` without `Quantity` used to buy or
+  quote 1; set `Quantity` explicitly.
+- `OrderRequest.SectionCode` is documented as required: it was always sent, and an empty value is
+  refused with `Set existed [sectionCode] from reference` — on purpose, the server does not guess
+  ipv4 for an empty section.
+- **Deprecated:** the package-level `Balance()` and `BalanceAdd()`. They have no error result: a
+  failed call comes back as `-1` / `""`. Use `BalanceE()` / `BalanceAddE()` or the `*Client`
+  methods.
+- README: the install section no longer says the module does not resolve — `v2.0.0` is tagged.
+
+### v2.0.0, part 2 of 2 — catching up with the server
 
 - **Errors no longer carry the API key.** A transport error (`*url.Error`: port closed, timeout, dropped connection, redirect) used to be returned as is, with the full URL — key included — in its text, and `APIError.Body` kept error pages that echo the path. The key is now replaced with `***`, in any letter case and URL-encoded too, in `*url.Error.URL`, `APIError.Body`, the messages, `data` and `customData`; a wrapped transport error that quotes the key is replaced by one without it that keeps `Timeout()` and matches the same context errors. `fmt` prints a `*Client` with `apiKey: "***"`. `APIError.Body` of a reply without the JSON envelope keeps at most 500 characters.
 - **Behaviour change: money and write calls succeed only on `status: "success"`.** `status: "error"` with `data` and an empty `errors[]` used to pass as a success on every route; it stays one only on reads (the `*/calc` endpoints with insufficient funds) and is an `*APIError` on make and write calls, with `data.warning` as its text. A reply without the JSON envelope on these calls — HTML, an empty body, `204`, a non-object or truncated JSON with a 2xx status, or an HTTP 5xx page — used to surface as a bare `*json.SyntaxError` (or a plain `client api HTTP 502`); it is now an `*APIError` for which `errors.Is(err, ErrUnexpectedResponse)` holds, with the text `unexpected response (no JSON envelope): the request may have been executed, check before retrying`. Added `ErrUnexpectedResponse` and `APIError.Unwrap`. Reads, `*/calc` and downloads are unchanged.
@@ -540,7 +560,7 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 - Fixed the "Paying for orders" example: it took `payments[0]` from `BalancePaymentsList`, which lists top-up systems for `AddBalance` only and never the balance itself. Orders and renewals are paid with `SetPaymentCode("balance")` or `SetPaymentCode("paddle_subscription")` (the saved card) — the only two systems `order/make` accepts.
 - Test suite repaired and extended. `go test ./...` had stopped compiling: `TestAutoTopupLimitsFromError` still referenced `MinDailyCountCap`, removed with the caps above. `TestProlongMakeInsufficientFundsIsAnError` still asserted the old insufficient-funds shape (`status:"error"` with an empty `errors[]`); the server now sends `errors[{code:16}]`, and the test covers that plus the case the removed guard used to break — a legitimate success with an empty `orderId` must keep `total` and `listBaseOrderNumbers`. Added `TestGenerateAuthPrecedence`: `OrderRequest.GenerateAuth` outranks `SetGenerateAuth()`, and neither is sent on `order/calc`, which drops the field.
 
-### v2 (current)
+### v2.0.0, part 1 of 2
 
 - Added `balance/autotopup/get` and `balance/autotopup/set` with partial-update semantics (`AutoTopupSetRequest`, `AutoTopupState`, `AutoTopupLimitsFromError`).
 - `APIErrorItem.Code` is now the typed `APIErrorCode` instead of `interface{}`; added `CodeInt`, `HasCode`, `Messages`, `FirstCustomData`, `IsAccessError`.
