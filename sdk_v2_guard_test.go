@@ -261,6 +261,52 @@ func TestAssertExt(t *testing.T) {
 	}
 }
 
+// Protocol и Host — схема и шлюз в строках резидентов. Это не Proto (порты IPv4): уходят своими
+// параметрами и только когда заданы, без них запрос прежний.
+func TestDownloadProxiesSendsResidentProtocolAndHost(t *testing.T) {
+	var path string
+	var query url.Values
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		query = r.URL.Query()
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("socks5://a:b@us.res.proxy-seller.com:10000"))
+	})
+
+	file, err := client.DownloadProxies("resident", ProxyDownloadOptions{
+		ListID: "561", Protocol: "socks5", Host: "us.res.proxy-seller.com"})
+	if err != nil || string(file) != "socks5://a:b@us.res.proxy-seller.com:10000" {
+		t.Fatalf("DownloadProxies(resident): file=%q err=%v", file, err)
+	}
+	if !strings.HasSuffix(path, "/proxy/download/resident") {
+		t.Fatalf("маршрут %q, ждали proxy/download/resident", path)
+	}
+	if query.Get("protocol") != "socks5" || query.Get("host") != "us.res.proxy-seller.com" {
+		t.Fatalf("protocol/host не дошли: %v", query)
+	}
+	if _, ok := query["proto"]; ok {
+		t.Fatalf("Protocol не должен уходить как proto: %v", query)
+	}
+
+	if _, err := client.DownloadProxies("subresident", ProxyDownloadOptions{
+		PackageKey: "PKG", Protocol: "http", Host: "asia.res.proxy-seller.com"}); err != nil {
+		t.Fatalf("DownloadProxies(subresident): %v", err)
+	}
+	if query.Get("protocol") != "http" || query.Get("host") != "asia.res.proxy-seller.com" || query.Get("package_key") != "PKG" {
+		t.Fatalf("subresident: %v", query)
+	}
+
+	if _, err := client.DownloadProxies("resident", ProxyDownloadOptions{ListID: "561"}); err != nil {
+		t.Fatalf("DownloadProxies без protocol: %v", err)
+	}
+	if _, ok := query["protocol"]; ok {
+		t.Fatalf("без Protocol параметр уходить не должен: %v", query)
+	}
+	if _, ok := query["host"]; ok {
+		t.Fatalf("без Host параметр уходить не должен: %v", query)
+	}
+}
+
 // Бинарные выгрузки: старые подписи глотают ошибку и отдают пустую строку, *E-варианты
 // обязаны её возвращать.
 func TestBinaryDownloadsHaveErrorVariants(t *testing.T) {
