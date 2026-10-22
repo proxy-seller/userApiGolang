@@ -2587,10 +2587,12 @@ func (c *Client) ProxyReplace(ids interface{}, replaceReason string, comment str
 
 // ProxyDownloadResident Export the resident proxy list.
 //
-// Маршрут /proxy/download/resident литеральный и принимает только listId (алиас id), ext и
-// maxLine. package_key он ИГНОРИРУЕТ — выгрузится
+// Маршрут /proxy/download/resident литеральный и принимает только listId (алиас id), ext,
+// maxLine, protocol и host. package_key он ИГНОРИРУЕТ — выгрузится
 // родительский пакет. Для листа субпакета нужен другой маршрут:
 // DownloadProxies("subresident", ProxyDownloadOptions{ListID: ..., PackageKey: ...}).
+// Схема и шлюз в строках (protocol, host) — через
+// DownloadProxies("resident", ProxyDownloadOptions{Protocol: ..., Host: ...}): у этой подписи их нет.
 //
 // Ответ — файл-attachment, а не конверт. Слишком длинный или запрещённый ext сервер отбивает
 // голым HTTP 400 плайн-текстом (см. assertExt): legacy-подпись вернёт "",
@@ -3224,14 +3226,23 @@ type ProxyDownloadOptions struct {
 	// MaxLine — сколько строк отдать, целым числом; принимает ТОЛЬКО proxy/download/resident.
 	// Прочие типы параметр игнорируют, поэтому SDK шлёт его только для resident.
 	MaxLine int
+	// Protocol — схема в строках резидентов: http | socks5, только resident и subresident. При txt
+	// строка становится socks5://login:password@host:port, csv не меняется, свой шаблон получает
+	// значение в %protocol%; пусто — строки без схемы, как раньше. Логин, пароль и порты у обоих
+	// протоколов одни; socks5 несёт ещё UDP и HTTP/3 (QUIC) к сайтам. Это не Proto: тот выбирает
+	// порты IPv4.
+	Protocol string
+	// Host — шлюз в строках резидентов: res.proxy-seller.com (по умолчанию),
+	// us.res.proxy-seller.com, asia.res.proxy-seller.com. Только resident и subresident.
+	Host string
 }
 
 // DownloadProxies — выгрузка прокси файлом. Ответ — attachment, а не конверт
 // {status,data,errors}; ошибки доступа при этом приходят конвертом и разбираются в APIError.
 //
 // proxy/download/resident — ЛИТЕРАЛЬНЫЙ маршрут, а не подстановка в {type}: он специфичнее
-// шаблона и перехватывает запрос на себя. Принимает только listId (алиас id), ext и maxLine —
-// proto, country и ends на нём молча выбрасываются.
+// шаблона и перехватывает запрос на себя. Принимает только listId (алиас id), ext, maxLine,
+// protocol и host — proto, country и ends на нём молча выбрасываются.
 func (c *Client) DownloadProxies(proxyType string, options ProxyDownloadOptions) ([]byte, error) {
 	if err := assertExt(options.Ext); err != nil {
 		return nil, err
@@ -3260,6 +3271,12 @@ func (c *Client) DownloadProxies(proxyType string, options ProxyDownloadOptions)
 	}
 	if options.MaxLine > 0 && strings.EqualFold(strings.TrimSpace(proxyType), "resident") {
 		query.Set("maxLine", strconv.Itoa(options.MaxLine))
+	}
+	if options.Protocol != "" {
+		query.Set("protocol", options.Protocol)
+	}
+	if options.Host != "" {
+		query.Set("host", options.Host)
 	}
 	path := "proxy/download/" + url.PathEscape(proxyType)
 	if encoded := query.Encode(); encoded != "" {

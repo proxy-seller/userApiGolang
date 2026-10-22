@@ -385,6 +385,14 @@ file, err := client.DownloadProxies("subresident", api.ProxyDownloadOptions{
 })
 ```
 
+- Residential lines take the connection scheme in `Protocol` (`http` or `socks5`) and the gateway in `Host`, on `resident` and `subresident`. With `txt` a line becomes `socks5://login:password@host:port`, `csv` keeps its columns, and a custom template gets the value in `%protocol%`; without `Protocol` the lines have no scheme, as before. Login, password and ports are the same for both protocols; `socks5` also carries UDP and HTTP/3 (QUIC) to websites. Gateways: `res.proxy-seller.com` (Europe, the default), `us.res.proxy-seller.com`, `asia.res.proxy-seller.com` — pick the one closest to your server. This is not `Proto`, which selects IPv4 ports. The legacy `ProxyDownloadResident` does not take them — use `DownloadProxies`:
+
+```go
+file, err := client.DownloadProxies("resident", api.ProxyDownloadOptions{
+    ListID: "561", Protocol: "socks5", Host: "us.res.proxy-seller.com",
+})
+```
+
 The legacy download helpers return a bare `string`/`[]byte` and swallow errors. Use the `*E` variants when you need the reason: `ProxyDownloadE`, `ProxyDownloadResidentE`, `ResidentGeoE`, `ResidentGeoIspE` (or the `*Client` methods, which all return an error).
 
 ## Renewing proxies
@@ -515,6 +523,10 @@ Raw scalar `data` is available in `ResultData.Value`; object and array values re
 The tag `v2.0.0` (2026-10-01) is the first release of the `/v2` module and contains both
 `v2.0.0` parts below. They were written while v2 was still in development, and part 2 was
 planned as v2.0.1 at the time; nothing was tagged in between.
+
+### Unreleased
+
+- Added `ProxyDownloadOptions.Protocol` and `ProxyDownloadOptions.Host` (`protocol`, `host`): the connection scheme (`http` / `socks5`) and the gateway in residential lines, on `DownloadProxies("resident", ...)` and `DownloadProxies("subresident", ...)`. They are sent only when set, so existing calls send the same request. The legacy positional `ProxyDownloadResident` is unchanged and does not take them.
 
 ### v2.0.1 — 2026-10-02
 
